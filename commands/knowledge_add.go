@@ -34,7 +34,7 @@ func buildKnowledgeAddCmd() *cobra.Command {
 		Short:   "Install an OKF bundle from GitHub, GitLab, URL, or local path",
 		Aliases: []string{"a"},
 		Long: fmt.Sprintf(`Install a knowledge bundle into the project's knowledge directory
-(default ./%s) and record it in knowledge-lock.json.
+(default ./%s) and record it in %s.
 
 Sources use the same forms as skills: owner/repo shorthand, full URLs,
 and local paths, with an optional #ref for version pinning.
@@ -43,7 +43,7 @@ and local paths, with an optional #ref for version pinning.
   mdm knowledge add acme/sales-knowledge
   mdm knowledge add acme/sales-knowledge#v2.1.0
   mdm knowledge add https://github.com/acme/sales-knowledge
-  mdm knowledge add ./local-bundle`, defaultKnowledgeDir, ansiBold, ansiReset),
+  mdm knowledge add ./local-bundle`, defaultKnowledgeDir, lockName, ansiBold, ansiReset),
 		Args: cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			runKnowledgeAdd(args[0], opts)
@@ -92,7 +92,7 @@ func runKnowledgeAdd(sourceInput string, opts KnowledgeAddOptions) {
 		os.Exit(1)
 	}
 
-	baseEntry := knowledgeLockEntry(parsed, sourceInput)
+	baseEntry := knowledgeLockEntry(parsed, sourceInput, cwd)
 	installed := 0
 	for _, c := range selected {
 		if installKnowledgeCandidate(c, baseEntry, opts, cwd) {
@@ -209,7 +209,7 @@ func selectKnowledgeCandidates(candidates []knowledgeCandidate, opts KnowledgeAd
 }
 
 // scanKnowledgeCandidates runs the hidden-character scan over every selected
-// bundle. Bundles are agent-bound markdown, so this gate is mandatory.
+// bundle. Bundles are harness-bound markdown, so this gate is mandatory.
 func scanKnowledgeCandidates(selected []knowledgeCandidate, allow bool) bool {
 	ok := true
 	for _, c := range selected {
@@ -228,7 +228,7 @@ func scanKnowledgeCandidates(selected []knowledgeCandidate, allow bool) bool {
 
 // knowledgeLockEntry builds the source-level part of the lock entry shared by
 // every bundle installed from this invocation.
-func knowledgeLockEntry(parsed source.ParsedSource, sourceInput string) lock.KnowledgeLockEntry {
+func knowledgeLockEntry(parsed source.ParsedSource, sourceInput, cwd string) lock.KnowledgeLockEntry {
 	entry := lock.KnowledgeLockEntry{
 		Source:      stripSourceRef(sourceInput),
 		SourceType:  string(parsed.Type),
@@ -237,7 +237,11 @@ func knowledgeLockEntry(parsed source.ParsedSource, sourceInput string) lock.Kno
 		SpecVersion: knowledgeSpecVersion,
 	}
 	if parsed.Type == source.SourceTypeLocal {
-		entry.Source = parsed.LocalPath
+		// ParseSource resolves a local path to an absolute one, which is a fact
+		// about one machine. The lock is meant to set a teammate up from a
+		// fresh clone, so it records the cwd-relative form skills and agent
+		// definitions already use.
+		entry.Source = toRelSourcePath(parsed.LocalPath, cwd)
 		entry.SourceURL = ""
 	} else {
 		entry.Ref = parsed.Ref
@@ -277,7 +281,7 @@ func installKnowledgeCandidate(c knowledgeCandidate, baseEntry lock.KnowledgeLoc
 		entry.ContentHash = hash
 	}
 	if err := lock.AddBundleToKnowledgeLock(c.Name, entry, cwd); err != nil {
-		ui.LogWarn(fmt.Sprintf("could not update knowledge-lock.json: %v", err))
+		ui.LogWarn(fmt.Sprintf("could not update %s: %v", lockName, err))
 	}
 
 	msg := fmt.Sprintf("%s (%d document(s))", c.Name, c.Docs)

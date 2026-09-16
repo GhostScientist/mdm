@@ -125,7 +125,7 @@ func TestUpstreamRecordUsesTheSourceAsTyped(t *testing.T) {
 // Forking a skill that mdm installed earlier must credit the repository it came
 // from, not the local directory the files were copied out of.
 func TestUpstreamRecordCreditsTheOriginalUpstream(t *testing.T) {
-	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	isolateHome(t)
 	cwd := t.TempDir()
 	installed := filepath.Join(cwd, ".agents", "skills")
 	s := newTestSkill(t, installed, "code-review", "---\nname: code-review\ndescription: b\n---\n")
@@ -158,7 +158,7 @@ func TestUpstreamRecordCreditsTheOriginalUpstream(t *testing.T) {
 }
 
 func TestUpstreamRecordKeepsLocalSourcesLocal(t *testing.T) {
-	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	isolateHome(t)
 	cwd := t.TempDir()
 	s := newTestSkill(t, cwd, "vendor/a", "---\nname: a\ndescription: b\n---\n")
 
@@ -254,7 +254,7 @@ func TestForkLabels(t *testing.T) {
 // ─── Guards against destroying a fork ──────────────────────────────────────────
 //
 // A fork lives in ./skills, which is also OpenClaw's project skills directory.
-// Every command that treats an agent's skills directory as disposable can reach
+// Every command that treats a harness's skills directory as disposable can reach
 // a fork through it, so each guard is pinned here.
 
 func writeTestFork(t *testing.T, dir string) {
@@ -290,38 +290,65 @@ func TestIsCherryPickedSource(t *testing.T) {
 	}
 }
 
-func TestRemoveAgentSkillsDirKeepsForks(t *testing.T) {
+func TestRemoveHarnessSkillsDirKeepsForks(t *testing.T) {
 	skillsDir := t.TempDir()
 	writeTestFork(t, filepath.Join(skillsDir, "forked"))
+	// A copy-mode install: a real directory whose name the lock records.
 	writeTestFile(t, filepath.Join(skillsDir, "installed", "SKILL.md"), "---\nname: installed\ndescription: b\n---\n")
 
-	kept, removed := removeAgentSkillsDir(skillsDir)
+	kept, removed := removeHarnessSkillsDir(skillsDir, map[string]bool{"installed": true})
 	if !removed || kept != 1 {
 		t.Fatalf("kept = %d, removed = %v; want 1, true", kept, removed)
 	}
 	if _, err := os.Stat(filepath.Join(skillsDir, "forked", "SKILL.md")); err != nil {
-		t.Error("the fork must survive an agent removal")
+		t.Error("the fork must survive a harness removal")
 	}
 	if _, err := os.Stat(filepath.Join(skillsDir, "installed")); !os.IsNotExist(err) {
-		t.Error("the installed skill should have been removed")
+		t.Error("the locked copy-mode install should have been removed")
 	}
 }
 
-func TestRemoveAgentSkillsDirRemovesEverythingWhenNoForks(t *testing.T) {
+func TestRemoveHarnessSkillsDirRemovesEverythingWhenNoForks(t *testing.T) {
 	parent := t.TempDir()
 	skillsDir := filepath.Join(parent, "skills")
 	writeTestFile(t, filepath.Join(skillsDir, "installed", "SKILL.md"), "---\nname: installed\ndescription: b\n---\n")
 
-	kept, removed := removeAgentSkillsDir(skillsDir)
+	kept, removed := removeHarnessSkillsDir(skillsDir, map[string]bool{"installed": true})
 	if !removed || kept != 0 {
 		t.Fatalf("kept = %d, removed = %v; want 0, true", kept, removed)
 	}
 	if _, err := os.Stat(skillsDir); !os.IsNotExist(err) {
-		t.Error("a directory with no forks in it should be removed whole, as before")
+		t.Error("a directory with only mdm-installed skills should be removed whole, as before")
 	}
 }
 
-// Installing a fork into an agent that reads the forks directory would replace
+// TestRemoveHarnessSkillsDirKeepsHandMadeSkills pins the S4 fix: a real skill
+// directory the user created by hand - not a symlink, not a fork, and not
+// recorded in the lock - is not mdm's to delete, so it survives, and the
+// harness directory that still holds it survives too.
+func TestRemoveHarnessSkillsDirKeepsHandMadeSkills(t *testing.T) {
+	skillsDir := t.TempDir()
+	// A symlink install mdm made: removed.
+	target := t.TempDir()
+	if err := os.Symlink(target, filepath.Join(skillsDir, "linked")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	// A hand-made skill the lock does not record: kept.
+	writeTestFile(t, filepath.Join(skillsDir, "hand-made", "SKILL.md"), "---\nname: hand-made\ndescription: mine\n---\n")
+
+	kept, removed := removeHarnessSkillsDir(skillsDir, map[string]bool{"linked": true})
+	if !removed || kept != 1 {
+		t.Fatalf("kept = %d, removed = %v; want 1, true", kept, removed)
+	}
+	if _, err := os.Stat(filepath.Join(skillsDir, "hand-made", "SKILL.md")); err != nil {
+		t.Error("a hand-made skill mdm never installed must survive a harness removal")
+	}
+	if _, err := os.Lstat(filepath.Join(skillsDir, "linked")); !os.IsNotExist(err) {
+		t.Error("the symlink install should have been removed")
+	}
+}
+
+// Installing a fork into a harness that reads the forks directory would replace
 // the fork with a symlink to a copy of itself - destroying the source.
 func TestClobbersForks(t *testing.T) {
 	cwd := t.TempDir()
@@ -338,7 +365,7 @@ func TestClobbersForks(t *testing.T) {
 		t.Error("the canonical skills directory must be treated as clobbering too")
 	}
 
-	kept := dropClobberingAgents([]string{"openclaw", "claude-code"}, false, cwd, forksRoot)
+	kept := dropClobberingHarnesses([]string{"openclaw", "claude-code"}, false, cwd, forksRoot)
 	if len(kept) != 1 || kept[0] != "claude-code" {
 		t.Errorf("kept = %v, want only claude-code", kept)
 	}

@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
-| **Stability** | Experimental - gated behind `MDM_EXPERIMENTAL=plugins` / `mdm experimental enable plugins` |
+| **Status** | Implemented - graduated to full support in v2 |
+| **Stability** | Stable. This document is the original design spec, kept as a historical record: the experimental gate it describes was removed in v2, and the separate `plugins-lock.json` became the `plugins` section of `mdm.lock` (see `mdm migrate`). |
 | **Author** | Dakota Kim |
 | **Created** | 2026-08-06 |
 | **Tracking issue** | TBD |
@@ -37,11 +37,11 @@ plugin package itself.
    without fetching schemas, fixed-location component discovery, path
    containment, and the resilience rules (a broken `mcp.json` disables MCP
    only; a broken server or skill is skipped individually).
-3. **MCP wiring**: translate `mcp.json` into each agent's native MCP config
+3. **MCP wiring**: translate `mcp.json` into each harness's native MCP config
    (Claude Code's `.mcp.json`, Cursor's `.cursor/mcp.json`), performing the
    launcher duties the spec assigns to clients - `${PLUGIN_ROOT}` /
    `${PLUGIN_DATA}` expansion, env injection, command resolution - at install
-   time, since the agent (not mdm) launches the servers.
+   time, since the harness (not mdm) launches the servers.
 4. **Author tooling**: `mdm plugins init` scaffolds a conformant plugin;
    `mdm plugins validate` checks one against the spec.
 
@@ -83,7 +83,7 @@ mdm plugins
   install, preserved across updates, deleted only by `remove --purge-data`.
   Doctor suggests gitignoring `plugins-data/` once it holds anything.
 - `.agents/skills/<skill>` - a **symlink into the plugin directory**, and each
-  agent's skills dir links to the canonical entry as usual. One copy on disk,
+  harness's skills dir links to the canonical entry as usual. One copy on disk,
   atomic updates, and ownership is self-evident from the link target.
 
 ### Lock file: separate by design
@@ -92,8 +92,8 @@ mdm plugins
 `knowledge-lock.json`: the skill locks are read into fixed structs and
 rewritten wholesale, so an older mdm binary touching skills would silently
 drop unknown keys. Entries record source/ref, install and data dirs, spec and
-plugin versions, content hash, installed skills and agents, and the namespaced
-MCP server ids written per agent.
+plugin versions, content hash, installed skills and harnesses, and the namespaced
+MCP server ids written per harness.
 
 ### Coexistence with skills-lock.json
 
@@ -114,21 +114,38 @@ is ever written to `skills-lock.json`. When the gate is on:
 
 ### MCP wiring (`internal/mcpwire`)
 
-A per-agent target registry, deliberately separate from the stable
-`internal/agent` registry: `{AgentName, ConfigPath, ServersKey, style}`.
+A per-harness target registry, deliberately separate from the stable
+`internal/harness` registry: `{HarnessName, ConfigPath, ServersKey, style}`.
 Claude Code (`.mcp.json`, typed entries with streamable HTTP spelled `http`)
-and Cursor (`.cursor/mcp.json`, bare entries) ship in v1; another agent is one
+and Cursor (`.cursor/mcp.json`, bare entries) ship in v1; another harness is one
 map entry.
 
 Server ids are namespaced `<plugin>--<server>` - the spec forbids `--` inside
 plugin names, so the split is unambiguous, and it avoids the `:` and `__`
-sequences agents use for MCP tool-name mangling.
+sequences harnesses use for MCP tool-name mangling.
 
 Because mdm writes config rather than launching servers, everything the spec
 requires of the launcher is baked in at install time: `${PLUGIN_ROOT}` and
 `${PLUGIN_DATA}` become absolute paths, both variables are injected into the
-server's `env`, `./`-prefixed commands resolve inside the plugin root (with
-containment re-checked), and an omitted `cwd` is written as the plugin root.
+server's `env`, and `./`-prefixed commands resolve inside the plugin root (with
+containment re-checked).
+
+`cwd` is written only for a harness that reads one. Claude Code does not: its
+stdio schema is `command`, `args` and `env`, and a configured `cwd` is dropped
+rather than applied, so writing one put this machine's absolute path into a
+committed file and changed nothing. A plugin that declares a `cwd` for such a
+harness is told its server will start in the project root.
+
+**The written config is machine-local.** The absolute paths above cannot be
+made portable: Claude Code expands `${VAR}` in `.mcp.json` only from variables
+it already holds, and `CLAUDE_PROJECT_DIR` is set in the *server's*
+environment rather than its own, so `${CLAUDE_PROJECT_DIR}` in the config reads
+as a missing variable; Cursor expands nothing. A stdio server living inside the
+repository therefore has to be named by an absolute path. Treat the MCP config
+the way `.agents/` is already treated - generated output regenerated from
+`mdm.lock` by `mdm plugins install` - rather than a file whose contents travel
+between machines. `mdm doctor` says so once a plugin has wired servers into
+it.
 Config merges preserve every key mdm does not own; removal deletes exactly the
 recorded ids and never the file.
 
@@ -153,7 +170,7 @@ with a warning.
 ### Doctor integration
 
 Gated section: missing/invalid plugin dirs, content-hash drift, broken or
-re-owned skill links, MCP ids missing from agent config, orphaned mdm-managed
+re-owned skill links, MCP ids missing from harness config, orphaned mdm-managed
 ids, and the `plugins-data/` gitignore hint.
 
 ## Package layout
@@ -161,7 +178,7 @@ ids, and the `plugins-data/` gitignore hint.
 | Path | Role |
 |---|---|
 | `internal/plugin/` | Spec conformance: manifest, name rules, mcp.json, path containment, discovery, hashing |
-| `internal/mcpwire/` | Per-agent MCP config targets, rendering, read-merge-write |
+| `internal/mcpwire/` | Per-harness MCP config targets, rendering, read-merge-write |
 | `internal/lock/plugins.go` | `plugins-lock.json` read/write |
 | `commands/plugins*.go` | The command group, one file per subcommand |
 
@@ -183,7 +200,7 @@ ids, and the `plugins-data/` gitignore hint.
 
 - The upstream spec sees real multi-client adoption without breaking changes.
 - Global scope lands with a safe answer for shared global config files.
-- MCP targets cover the majority of MCP-capable agents in `AllAgents`.
+- MCP targets cover the majority of MCP-capable harnesses in `AllHarnesses`.
 - Command surface survives a release cycle without changes.
 
 ## Exit criteria (removal)

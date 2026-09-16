@@ -11,7 +11,7 @@ hide:
 # mdm
 
 <p class="mdm-hero__tagline">
-The markdown management CLI. Install skills, keep every agent's instruction file
+The markdown management CLI. Install skills, keep every harness's instruction file
 in sync, and audit them all for prompt-injection risks - from one fast, Go-native tool.
 <strong>No telemetry. Fully open source.</strong>
 </p>
@@ -44,7 +44,7 @@ Then link your instruction files and add your first skill:
 
 ```bash
 mdm rules link                          # AGENTS.md becomes the source of truth
-mdm skills add anthropics/skills        # install a skill for every configured agent
+mdm skills add anthropics/skills        # install a skill for every configured harness
 ```
 
 See the [installation guide](installation.md) for other methods and PATH tips.
@@ -60,7 +60,7 @@ solves exactly that.
 
 <div class="grid cards" markdown>
 
--   :material-robot-happy:{ .lg .middle } __45 agents supported__
+-   :material-robot-happy:{ .lg .middle } __45 harnesses supported__
 
     ---
 
@@ -71,7 +71,7 @@ solves exactly that.
 
     ---
 
-    `mdm rules link` makes `AGENTS.md` canonical and symlinks every agent's
+    `mdm rules link` makes `AGENTS.md` canonical and symlinks every harness's
     expected filename to it.
 
     [:octicons-arrow-right-24: Rules guide](rules.md)
@@ -108,28 +108,28 @@ solves exactly that.
 
     ---
 
-    Commit a `skills-lock.json` so teammates run `mdm skills install` once and
-    onboard with whatever agent they prefer.
+    Commit an `mdm.lock` so teammates run `mdm skills install` once and
+    onboard with whatever harness they prefer.
 
     [:octicons-arrow-right-24: skills install](skills/install.md)
 
--   :material-flask-outline:{ .lg .middle } __Knowledge bundles__ _(experimental)_
+-   :material-book-open-outline:{ .lg .middle } __Knowledge bundles__
 
     ---
 
     `mdm knowledge` installs, validates, and updates Open Knowledge Format (OKF)
-    bundles behind an experimental flag.
+    bundles.
 
-    [:octicons-arrow-right-24: Experimental features](experimental.md)
+    [:octicons-arrow-right-24: Knowledge](specs/knowledge.md)
 
--   :material-flask-outline:{ .lg .middle } __Agent Plugins__ _(experimental)_
+-   :material-puzzle-outline:{ .lg .middle } __Agent Plugins__
 
     ---
 
     `mdm plugins` installs and validates Agent Plugins - portable packages of
-    skills and MCP servers - behind an experimental flag.
+    skills and MCP servers.
 
-    [:octicons-arrow-right-24: Experimental features](experimental.md)
+    [:octicons-arrow-right-24: Plugins](specs/plugins.md)
 
 </div>
 
@@ -139,12 +139,15 @@ solves exactly that.
 
 ```text
 mdm
-├── skills        Manage skills for AI agents (add · cherry-pick · remove · list · find · update · audit · init · install · sync)
-├── rules         Link/unlink agent instruction files to a single AGENTS.md
-├── agents        Manage the configured agent list used as default install targets
-├── knowledge     [experimental] Manage OKF knowledge bundles
-├── plugins       [experimental] Manage Agent Plugins (skills + MCP servers)
+├── skills        Manage skills for AI harnesses (add · cherry-pick · remove · list · find · update · audit · init · install · sync)
+├── rules         Link/unlink harness instruction files to a single AGENTS.md
+├── harnesses     Manage the configured harness list used as default install targets
+├── agents        Manage agent definitions installed into harnesses (add · list · remove · update · install)
+├── knowledge     Manage OKF knowledge bundles
+├── plugins       Manage Agent Plugins (skills + MCP servers)
 ├── doctor        Check installed skills and project markdown for health issues
+├── migrate       Fold v1 lock files into mdm.lock
+├── bug           Open a prefilled bug-report form (no network I/O)
 ├── experimental  Manage experimental feature gates
 ├── upgrade       Self-update the mdm binary from GitHub releases
 ├── uninstall     Remove the mdm binary from your system

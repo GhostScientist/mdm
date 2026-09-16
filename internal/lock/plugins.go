@@ -4,20 +4,12 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"sort"
 	"time"
 )
 
-// ──────────────────────────────────────────────────────────
-// Agent Plugins lock (plugins-lock.json, project scope)
-//
-// Plugin entries deliberately live in their own file rather than in
-// skills-lock.json, for the same reason knowledge entries do: the skill
-// locks are read into fixed structs and rewritten wholesale, so an older
-// mdm binary touching skills would silently drop unknown keys. A separate
-// file keeps the experimental plugins feature invisible to - and
-// incorruptible by - stable binaries.
-// ──────────────────────────────────────────────────────────
+// Agent Plugins lock: the plugins section of mdm.lock. v1 kept plugin entries
+// in their own plugins-lock.json. In v2 mdm.lock preserves unknown top-level
+// keys on every write (see project.go), so the sections share one file safely.
 
 const pluginsLockVersion = 1
 
@@ -32,64 +24,59 @@ type PluginLockEntry struct {
 	SpecVersion string `json:"specVersion"`
 	Version     string `json:"version,omitempty"` // the manifest's version field
 	ContentHash string `json:"contentHash,omitempty"`
-	// Skills lists the sanitized names installed into agent skill
-	// directories; SkillAgents lists the agents they were installed for.
+	// Skills lists the sanitized names installed into harness skill
+	// directories; SkillAgents lists the harnesses they were installed for.
 	Skills      []string `json:"skills,omitempty"`
 	SkillAgents []string `json:"skillAgents,omitempty"`
-	// MCP maps an agent name to the namespaced server ids written into
-	// that agent's MCP config file.
+	// MCP maps a harness name to the namespaced server ids written into
+	// that harness's MCP config file.
 	MCP         map[string][]string `json:"mcp,omitempty"`
 	InstalledAt string              `json:"installedAt"`
 	UpdatedAt   string              `json:"updatedAt"`
 }
 
+// PluginLockFile is a view of the plugins section of the project lock.
 type PluginLockFile struct {
 	Version int                        `json:"version"`
 	Plugins map[string]PluginLockEntry `json:"plugins"`
 }
 
-func GetPluginsLockPath(cwd string) string {
+// readLegacyPluginsLockE reads the v1 plugins-lock.json directly. It is only
+// consulted when mdm.lock does not exist. Corrupt or newer-versioned
+// files are an error, matching the final v1 patch releases.
+func readLegacyPluginsLockE(cwd string) (PluginLockFile, error) {
 	if cwd == "" {
 		cwd, _ = os.Getwd()
 	}
-	return filepath.Join(cwd, "plugins-lock.json")
-}
-
-func ReadPluginsLock(cwd string) PluginLockFile {
-	path := GetPluginsLockPath(cwd)
+	path := filepath.Join(cwd, "plugins-lock.json")
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return EmptyPluginsLock()
+		if os.IsNotExist(err) {
+			return EmptyPluginsLock(), nil
+		}
+		return EmptyPluginsLock(), errUnreadableLock(path, err)
 	}
 	var lk PluginLockFile
 	if err := json.Unmarshal(data, &lk); err != nil {
-		fatalUnreadableLock(path, err)
+		return EmptyPluginsLock(), errUnreadableLock(path, err)
 	}
 	if lk.Version > pluginsLockVersion {
-		fatalNewerLock(path, lk.Version, pluginsLockVersion)
+		return EmptyPluginsLock(), errNewerLock(path, lk.Version, pluginsLockVersion)
 	}
 	if lk.Plugins == nil || lk.Version < pluginsLockVersion {
-		return EmptyPluginsLock()
+		return EmptyPluginsLock(), nil
 	}
-	return lk
+	return lk, nil
+}
+
+func ReadPluginsLock(cwd string) PluginLockFile {
+	return PluginLockFile{Version: pluginsLockVersion, Plugins: ReadProjectLock(cwd).Plugins}
 }
 
 func WritePluginsLock(lk PluginLockFile, cwd string) error {
-	// Sort keys for deterministic output
-	sorted := PluginLockFile{Version: lk.Version, Plugins: map[string]PluginLockEntry{}}
-	keys := make([]string, 0, len(lk.Plugins))
-	for k := range lk.Plugins {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		sorted.Plugins[k] = lk.Plugins[k]
-	}
-	data, err := json.MarshalIndent(sorted, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(GetPluginsLockPath(cwd), append(data, '\n'), 0600)
+	pl := ReadProjectLock(cwd)
+	pl.Plugins = lk.Plugins
+	return WriteProjectLock(pl, cwd)
 }
 
 func EmptyPluginsLock() PluginLockFile {
@@ -115,8 +102,5 @@ func RemovePluginFromLock(name, cwd string) error {
 		return nil
 	}
 	delete(lk.Plugins, name)
-	if len(lk.Plugins) == 0 {
-		return os.Remove(GetPluginsLockPath(cwd))
-	}
 	return WritePluginsLock(lk, cwd)
 }

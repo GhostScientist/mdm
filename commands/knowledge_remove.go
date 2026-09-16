@@ -19,13 +19,13 @@ func buildKnowledgeRemoveCmd() *cobra.Command {
 		Use:     "remove [bundles...]",
 		Short:   "Remove installed knowledge bundles",
 		Aliases: []string{"rm", "r"},
-		Long: fmt.Sprintf(`Remove knowledge bundles and their knowledge-lock.json entries.
+		Long: fmt.Sprintf(`Remove knowledge bundles and their %s entries.
 
 If no bundle names are provided an interactive selection menu is shown.
 
 %sExamples:%s
   mdm knowledge remove
-  mdm knowledge remove sales -y`, ansiBold, ansiReset),
+  mdm knowledge remove sales -y`, lockName, ansiBold, ansiReset),
 		Args: cobra.ArbitraryArgs,
 		Run: func(cmd *cobra.Command, args []string) {
 			runKnowledgeRemove(args, yes)
@@ -43,7 +43,7 @@ func selectKnowledgeToRemove(lk lock.KnowledgeLockFile, names []string, yes bool
 			if _, ok := lk.Bundles[sanitizeName(name)]; ok {
 				keep = append(keep, sanitizeName(name))
 			} else {
-				ui.LogWarn(fmt.Sprintf("%s is not in knowledge-lock.json", name))
+				ui.LogWarn(fmt.Sprintf("%s is not in the lock file", name))
 			}
 		}
 		return keep, len(keep) > 0
@@ -99,7 +99,7 @@ func runKnowledgeRemove(names []string, yes bool) {
 			continue
 		}
 		if err := lock.RemoveBundleFromKnowledgeLock(name, cwd); err != nil {
-			ui.LogWarn(fmt.Sprintf("could not update knowledge-lock.json: %v", err))
+			ui.LogWarn(fmt.Sprintf("could not update %s: %v", lockName, err))
 		}
 		ui.LogSuccess(name)
 	}

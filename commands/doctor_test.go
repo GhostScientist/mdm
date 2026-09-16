@@ -6,6 +6,9 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/sethcarney/mdm/internal/harness"
+	"github.com/sethcarney/mdm/internal/lock"
 )
 
 // ── formatFileSize ─────────────────────────────────────────────────────────────
@@ -166,11 +169,11 @@ func TestCheckLargeMarkdownSkipsDirs(t *testing.T) {
 func TestCheckLargeMarkdownDetectsOversized(t *testing.T) {
 	dir := t.TempDir()
 
-	// Warn-level file (20KB ≤ size < 100KB)
+	// Warn-level file (fileSizeWarnBytes ≤ size < fileSizeErrorBytes)
 	if err := writeFileOfSize(filepath.Join(dir, "warn.md"), fileSizeWarnBytes+1); err != nil {
 		t.Fatal(err)
 	}
-	// Error-level file (≥ 100KB)
+	// Error-level file (≥ fileSizeErrorBytes)
 	if err := writeFileOfSize(filepath.Join(dir, "big.md"), fileSizeErrorBytes+1); err != nil {
 		t.Fatal(err)
 	}
@@ -188,10 +191,10 @@ func TestCheckLargeMarkdownDetectsOversized(t *testing.T) {
 		}
 	}
 	if !warnFound {
-		t.Error("expected a warn issue for the 20KB+ file")
+		t.Error("expected a warn issue for the warn-threshold file")
 	}
 	if !errFound {
-		t.Error("expected an error issue for the 100KB+ file")
+		t.Error("expected an error issue for the error-threshold file")
 	}
 }
 
@@ -211,8 +214,8 @@ func TestCheckProjectMarkdownSkipsExistingDirs(t *testing.T) {
 
 	// Non-existent dir added to skipDirs - should not cause a panic or side effects
 	skipDirs := map[string]bool{
-		filepath.Clean(skillsDir):                    true,
-		filepath.Join(root, "nonexistent-agent-dir"): true,
+		filepath.Clean(skillsDir):                      true,
+		filepath.Join(root, "nonexistent-harness-dir"): true,
 	}
 
 	issues, _ := checkProjectMarkdown(root, skipDirs, map[string]bool{})
@@ -421,7 +424,7 @@ func TestCheckLargeMarkdownVendorSkipped(t *testing.T) {
 }
 
 // TestDiagnoseSkillHealthySkill ensures a well-formed skill directory reports
-// no issues (except possibly agent-link checks that won't have links on disk).
+// no issues (except possibly harness-link checks that won't have links on disk).
 func TestDiagnoseSkillHealthySkill(t *testing.T) {
 	dir := t.TempDir()
 	content := "---\nname: My Skill\ndescription: A healthy skill\n---\nDo stuff.\n"
@@ -437,5 +440,300 @@ func TestDiagnoseSkillHealthySkill(t *testing.T) {
 
 	if len(r.Issues) != 0 {
 		t.Errorf("expected no issues for a healthy skill, got: %v", r.Issues)
+	}
+}
+
+// ── Migration checks ───────────────────────────────────────────────────────────
+
+// isolatedGlobalSkillsDir returns Claude Code's global skills directory under
+// a temp home, failing if the registry did not pick up the redirect: the
+// global sweep walks every harness's directory, so an un-isolated registry
+// would read the developer's real files.
+func isolatedGlobalSkillsDir(t *testing.T) string {
+	t.Helper()
+	home := isolateHome(t)
+	cfg := harness.AllHarnesses["claude-code"]
+	if cfg == nil || cfg.GlobalSkillsDir == "" {
+		t.Skip("fixture harness no longer supports global installs")
+	}
+	if !strings.HasPrefix(cfg.GlobalSkillsDir, home) {
+		t.Fatalf("harness registry not isolated: %q is outside the test home %q", cfg.GlobalSkillsDir, home)
+	}
+	return cfg.GlobalSkillsDir
+}
+
+// Copies on disk with no mode in the lock get re-symlinked by the next
+// restore; doctor is where the user learns to run `mdm migrate` first.
+func TestCheckProjectMigrationReportsPendingInstallModeBackfill(t *testing.T) {
+	cwd := t.TempDir()
+	if err := lock.SetConfiguredHarnesses([]string{"claude-code"}, false, cwd); err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.AddSkillToLocalLock("s1", lock.LocalSkillLockEntry{Source: "o/r", SourceType: "github"}, cwd); err != nil {
+		t.Fatal(err)
+	}
+	writeSkillDir(t, filepath.Join(cwd, ".claude", "skills", "s1"))
+
+	issues := checkProjectMigration(cwd)
+	if len(issues) != 1 {
+		t.Fatalf("issues = %v, want exactly one", issues)
+	}
+	if issues[0].Level != "warn" {
+		t.Errorf("level = %q, want warn", issues[0].Level)
+	}
+	if !strings.Contains(issues[0].Message, "mdm migrate") || !strings.Contains(issues[0].Message, "copy") {
+		t.Errorf("message = %q, want it to name copy mode and `mdm migrate`", issues[0].Message)
+	}
+}
+
+// A recorded mode, or nothing on disk to infer from, must stay quiet.
+func TestCheckProjectMigrationQuietWhenNothingPending(t *testing.T) {
+	cwd := t.TempDir()
+	if err := lock.AddSkillToLocalLock("s1", lock.LocalSkillLockEntry{Source: "o/r", SourceType: "github"}, cwd); err != nil {
+		t.Fatal(err)
+	}
+	if issues := checkProjectMigration(cwd); len(issues) != 0 {
+		t.Errorf("issues = %v, want none with nothing installed on disk", issues)
+	}
+
+	writeSkillDir(t, filepath.Join(cwd, ".claude", "skills", "s1"))
+	if err := lock.SetInstallMode(lock.InstallModeCopy, false, cwd); err != nil {
+		t.Fatal(err)
+	}
+	if issues := checkProjectMigration(cwd); len(issues) != 0 {
+		t.Errorf("issues = %v, want none once the mode is recorded", issues)
+	}
+}
+
+// The global scope has the same recovery.
+func TestCheckGlobalMigrationReportsPendingInstallModeBackfill(t *testing.T) {
+	globalSkills := isolatedGlobalSkillsDir(t)
+
+	if issues := checkGlobalMigration(true); len(issues) != 0 {
+		t.Fatalf("issues = %v, want none in an empty global scope", issues)
+	}
+
+	writeSkillDir(t, filepath.Join(globalSkills, "s1"))
+	if err := lock.AddSkillToGlobalState("s1", lock.SkillLockEntry{Source: "o/r", SourceType: "github"}); err != nil {
+		t.Fatal(err)
+	}
+
+	issues := checkGlobalMigration(true)
+	if len(issues) != 1 {
+		t.Fatalf("issues = %v, want exactly one", issues)
+	}
+	if issues[0].Level != "warn" {
+		t.Errorf("level = %q, want warn", issues[0].Level)
+	}
+	if !strings.Contains(issues[0].Message, "mdm migrate") || !strings.Contains(issues[0].Message, "copy") {
+		t.Errorf("message = %q, want it to name copy mode and `mdm migrate`", issues[0].Message)
+	}
+}
+
+// `mdm doctor -p` is a CI gate and must not exit 1 over a machine-global
+// file the project does not own: the problem is still reported, at warn.
+func TestCheckGlobalMigrationUnreadableStateIsAWarnOutsideGlobalScope(t *testing.T) {
+	isolateHome(t)
+
+	statePath := lock.GetGlobalStatePath()
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A truncated write, which is how this file actually ends up unreadable.
+	if err := os.WriteFile(statePath, []byte(`{"version": 2, "skills": {`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	projectIssues := checkGlobalMigration(false)
+	if len(projectIssues) != 1 {
+		t.Fatalf("issues = %v, want exactly one", projectIssues)
+	}
+	if projectIssues[0].Level != "warn" {
+		t.Errorf("level = %q, want warn: a project-scoped run must not exit 1 over global state", projectIssues[0].Level)
+	}
+	if !strings.Contains(projectIssues[0].Message, "global state could not be read") {
+		t.Errorf("message = %q, want it to name the unreadable global state", projectIssues[0].Message)
+	}
+
+	// Asking about global scope still gets the full-strength diagnosis.
+	globalIssues := checkGlobalMigration(true)
+	if len(globalIssues) != 1 {
+		t.Fatalf("issues = %v, want exactly one", globalIssues)
+	}
+	if globalIssues[0].Level != "error" {
+		t.Errorf("level = %q, want error when the run is about global scope", globalIssues[0].Level)
+	}
+}
+
+// A v1 lock gets the legacy warning, which names the file but not the
+// copies at stake, so the mode warning has to fire alongside it.
+func TestCheckProjectMigrationWarnsOnCopyModeWithLegacyLock(t *testing.T) {
+	cwd := t.TempDir()
+	legacy := `{"version":1,"skills":{"s1":{"source":"o/r","sourceType":"github"}},` +
+		`"configuredAgents":["claude-code"]}`
+	if err := os.WriteFile(filepath.Join(cwd, "skills-lock.json"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeSkillDir(t, filepath.Join(cwd, ".claude", "skills", "s1"))
+
+	issues := checkProjectMigration(cwd)
+	var legacyIssue, modeIssue bool
+	for _, i := range issues {
+		if strings.Contains(i.Message, "v1 lock file") {
+			legacyIssue = true
+		}
+		if strings.Contains(i.Message, "copy") && strings.Contains(i.Message, "mdm migrate") {
+			modeIssue = true
+			if i.Level != "warn" {
+				t.Errorf("mode issue level = %q, want warn", i.Level)
+			}
+		}
+	}
+	if !legacyIssue {
+		t.Errorf("issues = %v, want the legacy lock warning", issues)
+	}
+	if !modeIssue {
+		t.Errorf("issues = %v, want a warning that names copy mode and `mdm migrate`", issues)
+	}
+}
+
+// The global half of the same gap.
+func TestCheckGlobalMigrationWarnsOnCopyModeWithLegacyState(t *testing.T) {
+	globalSkills := isolatedGlobalSkillsDir(t)
+
+	writeSkillDir(t, filepath.Join(globalSkills, "s1"))
+	legacyPath, _ := lock.LegacyGlobalLockExists()
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The v1 global state file carries version 3; strictReadLegacyGlobal
+	// reads anything lower as empty.
+	legacy := `{"version":3,"skills":{"s1":{"source":"o/r","sourceType":"github"}},` +
+		`"configuredAgents":["claude-code"]}`
+	if err := os.WriteFile(legacyPath, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	issues := checkGlobalMigration(true)
+	var legacyIssue, modeIssue bool
+	for _, i := range issues {
+		if strings.Contains(i.Message, "v1 global state file") {
+			legacyIssue = true
+		}
+		if strings.Contains(i.Message, "copy") && strings.Contains(i.Message, "mdm migrate") {
+			modeIssue = true
+		}
+	}
+	if !legacyIssue {
+		t.Errorf("issues = %v, want the legacy state warning", issues)
+	}
+	if !modeIssue {
+		t.Errorf("issues = %v, want a warning that names copy mode and `mdm migrate`", issues)
+	}
+}
+
+// ── Agent install checks ──────────────────────────────────────────────────────
+
+// A broken agent symlink is the same class of problem as a broken skill
+// symlink and gets the same report.
+func TestDoctorReportsABrokenAgentSymlink(t *testing.T) {
+	cwd := t.TempDir()
+	installDir := filepath.Join(cwd, ".claude", "agents")
+	if err := os.MkdirAll(installDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(installDir, "critic.md")
+	if err := os.Symlink(filepath.Join(cwd, ".agents", "agents", "gone.md"), target); err != nil {
+		t.Skipf("symlinks unavailable on this host: %v", err)
+	}
+	if err := lock.AddAgentToLocalLock("critic", lock.AgentLockEntry{Source: "o/r", SourceType: "github", AgentPath: "agents/critic.md"}, cwd); err != nil {
+		t.Fatal(err)
+	}
+
+	issues, _ := checkAgentInstalls(cwd)
+	if len(issues) == 0 {
+		t.Fatal("doctor reported nothing for a broken agent symlink")
+	}
+}
+
+// A broken symlink and a definition installed nowhere need different messages,
+// so the user can tell `mdm agents install` from `mdm agents update`.
+// agentInstalledSomewhere counts a dangling symlink as installed, so that
+// remove never strands the canonical file; doctor still separates the two.
+func TestDoctorDistinguishesMissingAgentFromBrokenSymlink(t *testing.T) {
+	cwd := t.TempDir()
+
+	// "vanished": recorded in the lock, but nothing on disk in any harness -
+	// not even a broken link.
+	if err := lock.AddAgentToLocalLock("vanished", lock.AgentLockEntry{Source: "o/r", SourceType: "github", AgentPath: "agents/vanished.md"}, cwd); err != nil {
+		t.Fatal(err)
+	}
+
+	// "critic": one harness has a dangling symlink - installed, but broken.
+	installDir := filepath.Join(cwd, ".claude", "agents")
+	if err := os.MkdirAll(installDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(installDir, "critic.md")
+	if err := os.Symlink(filepath.Join(cwd, ".agents", "agents", "gone.md"), target); err != nil {
+		t.Skipf("symlinks unavailable on this host: %v", err)
+	}
+	if err := lock.AddAgentToLocalLock("critic", lock.AgentLockEntry{Source: "o/r", SourceType: "github", AgentPath: "agents/critic.md"}, cwd); err != nil {
+		t.Fatal(err)
+	}
+
+	issues, _ := checkAgentInstalls(cwd)
+
+	var vanishedMissing, vanishedBroken, criticMissing, criticBroken bool
+	for _, iss := range issues {
+		named := strings.Contains(iss.Message, `"vanished"`)
+		other := strings.Contains(iss.Message, `"critic"`)
+		notInstalled := strings.Contains(iss.Message, "not installed in any harness")
+		broken := strings.Contains(iss.Message, "broken symlink")
+		if named {
+			vanishedMissing = vanishedMissing || notInstalled
+			vanishedBroken = vanishedBroken || broken
+		}
+		if other {
+			criticMissing = criticMissing || notInstalled
+			criticBroken = criticBroken || broken
+		}
+	}
+
+	if !vanishedMissing {
+		t.Errorf("expected a 'not installed in any harness' issue for vanished; issues=%v", issues)
+	}
+	if vanishedBroken {
+		t.Errorf("vanished was never installed anywhere; it must not be reported as a broken symlink; issues=%v", issues)
+	}
+	if !criticBroken {
+		t.Errorf("expected a 'broken symlink' issue for critic; issues=%v", issues)
+	}
+	if criticMissing {
+		t.Errorf("critic has a (broken) install on disk; it must not also be reported as 'not installed in any harness'; issues=%v", issues)
+	}
+}
+
+// Mutation this test catches: reporting only the skill count in the doctor
+// summary. A project holding agent definitions and no skills was told "no
+// skills installed", which reads as "nothing is installed" while doctor had
+// just checked several definitions.
+func TestDoctorSummaryCountsAgentDefinitions(t *testing.T) {
+	out := captureStdout(t, func() { printDoctorSummary(0, 2, false, 0, 0) })
+	if strings.Contains(out, "no skills installed") {
+		t.Errorf("summary = %q; it says nothing is installed while 2 agent definitions were checked", out)
+	}
+	if !strings.Contains(out, "2 agent definition(s)") {
+		t.Errorf("summary = %q; it must report the agent definitions it checked", out)
+	}
+
+	both := captureStdout(t, func() { printDoctorSummary(3, 2, false, 0, 0) })
+	if !strings.Contains(both, "3 skill(s)") || !strings.Contains(both, "2 agent definition(s)") {
+		t.Errorf("summary = %q; it must report both counts", both)
+	}
+
+	neither := captureStdout(t, func() { printDoctorSummary(0, 0, false, 0, 0) })
+	if !strings.Contains(neither, "nothing installed") {
+		t.Errorf("summary = %q; with neither installed it must say so plainly", neither)
 	}
 }

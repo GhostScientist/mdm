@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/sethcarney/mdm/internal/lock"
+	"github.com/sethcarney/mdm/internal/ui"
 )
 
 func buildKnowledgeInstallCmd() *cobra.Command {
@@ -14,13 +15,18 @@ func buildKnowledgeInstallCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "install",
-		Short: "Restore all bundles from knowledge-lock.json",
-		Long: `Restore every knowledge bundle recorded in knowledge-lock.json,
+		Short: "Restore all bundles from " + lockName,
+		Long: `Restore every knowledge bundle recorded in ` + lockName + `,
 re-fetching each from its recorded source and ref. Intended for CI and
 onboarding, like 'mdm skills install'.`,
 		Args: cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
 			runKnowledgeInstall(allowHiddenChars)
+			// A restore that installed less than the lock describes must not
+			// look green to CI.
+			if restoreFailed {
+				os.Exit(1)
+			}
 		},
 	}
 
@@ -32,15 +38,26 @@ func runKnowledgeInstall(allowHiddenChars bool) {
 	cwd, _ := os.Getwd()
 	lk := lock.ReadKnowledgeLock(cwd)
 	if len(lk.Bundles) == 0 {
-		fmt.Printf("\n%sNo knowledge-lock.json found.%s\n\n", ansiDim, ansiReset)
+		fmt.Printf("\n%sNo knowledge bundles found in %s.%s\n\n", ansiDim, lockName, ansiReset)
 		fmt.Printf("Add bundles with %smdm knowledge add <source>%s\n\n", ansiText, ansiReset)
 		return
 	}
 
 	names := selectKnowledgeLockEntries(lk, nil)
-	fmt.Printf("\n%sRestoring %d bundle(s) from knowledge-lock.json...%s\n", ansiText, len(names), ansiReset)
+	fmt.Printf("\n%sRestoring %d bundle(s) from %s...%s\n", ansiText, len(names), lockName, ansiReset)
+	var unrestorable []string
 	for _, name := range names {
+		// An entry recorded from a local path this machine does not have is
+		// reported and skipped. The add path exits the process on a missing
+		// local directory, which would abandon every bundle after this one.
+		if why := unreachableLocalSource(lk.Bundles[name].Source, cwd); why != "" {
+			ui.LogWarn(fmt.Sprintf("%s: %s", name, why))
+			unrestorable = append(unrestorable, name)
+			continue
+		}
 		reinstallKnowledgeBundle(name, lk.Bundles[name], allowHiddenChars)
 	}
+	reportUnrestorable(unrestorable, "bundle",
+		"Move it into the repository, or re-add it from a source your team can reach.")
 	fmt.Printf("%sDone.%s\n\n", ansiText, ansiReset)
 }

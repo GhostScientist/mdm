@@ -2,162 +2,23 @@ package lock
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
-	"time"
-
-	"github.com/sethcarney/mdm/internal/agent"
 )
 
 // ──────────────────────────────────────────────────────────
-// Forward compatibility
-//
-// A project lock file this binary cannot understand must abort the
-// command, not read as empty: the old fallback made `mdm skills install`
-// in a project migrated by a newer mdm a silent no-op - exit 0, nothing
-// installed - which is the worst possible failure in CI. These helpers
-// end the process because every caller of the lock readers would have to
-// abort anyway, and a hard exit also stops read-modify-write commands
-// (`mdm skills add`) from clobbering a file written by a newer version.
-//
-// The global lock keeps its read-as-empty behavior: version resets there
-// are how old global locks are deliberately discarded on upgrade, and
-// newer mdm versions use a different global file name entirely.
-// ──────────────────────────────────────────────────────────
-
-func fatalNewerLock(path string, fileVersion, knownVersion int) {
-	fmt.Fprintf(os.Stderr, "%s was written by a newer version of mdm (lock version %d; this binary understands up to %d).\nUpgrade with 'mdm upgrade' to use this project.\n",
-		filepath.Base(path), fileVersion, knownVersion)
-	os.Exit(2)
-}
-
-func fatalUnreadableLock(path string, err error) {
-	fmt.Fprintf(os.Stderr, "%s could not be parsed: %v\nFix the file or restore it from version control, then re-run.\n",
-		filepath.Base(path), err)
-	os.Exit(2)
-}
-
-// ──────────────────────────────────────────────────────────
-// Global skill lock (~/.agents/skills-lock.json)
-// ──────────────────────────────────────────────────────────
-
-const globalLockVersion = 3
-
-type SkillLockEntry struct {
-	Source      string `json:"source"`
-	SourceType  string `json:"sourceType"`
-	SourceURL   string `json:"sourceUrl"`
-	Ref         string `json:"ref,omitempty"`
-	SkillPath   string `json:"skillPath,omitempty"`
-	InstalledAt string `json:"installedAt"`
-	UpdatedAt   string `json:"updatedAt"`
-	PluginName  string `json:"pluginName,omitempty"`
-}
-
-type DismissedPrompts struct {
-	FindSkillsPrompt bool `json:"findSkillsPrompt,omitempty"`
-}
-
-type SkillLockFile struct {
-	Version          int                       `json:"version"`
-	Skills           map[string]SkillLockEntry `json:"skills"`
-	Dismissed        DismissedPrompts          `json:"dismissed,omitempty"`
-	ConfiguredAgents []string                  `json:"configuredAgents,omitempty"`
-	Experimental     []string                  `json:"experimental,omitempty"`
-}
-
-func GetSkillLockPath() string {
-	if xdgState := os.Getenv("XDG_STATE_HOME"); xdgState != "" {
-		return filepath.Join(xdgState, "skills", "skills-lock.json")
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, agent.AgentsDir, "skills-lock.json")
-}
-
-func ReadSkillLock() SkillLockFile {
-	lockPath := GetSkillLockPath()
-	data, err := os.ReadFile(lockPath)
-	if err != nil {
-		return EmptySkillLock()
-	}
-	var lock SkillLockFile
-	if err := json.Unmarshal(data, &lock); err != nil {
-		return EmptySkillLock()
-	}
-	if lock.Skills == nil || lock.Version < globalLockVersion {
-		return EmptySkillLock()
-	}
-	return lock
-}
-
-func WriteSkillLock(lock SkillLockFile) error {
-	lockPath := GetSkillLockPath()
-	if err := os.MkdirAll(filepath.Dir(lockPath), 0755); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(lock, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(lockPath, data, 0600)
-}
-
-func EmptySkillLock() SkillLockFile {
-	return SkillLockFile{
-		Version: globalLockVersion,
-		Skills:  map[string]SkillLockEntry{},
-	}
-}
-
-func AddSkillToLock(skillName string, entry SkillLockEntry) error {
-	lock := ReadSkillLock()
-	now := time.Now().UTC().Format(time.RFC3339)
-	if existing, ok := lock.Skills[skillName]; ok {
-		entry.InstalledAt = existing.InstalledAt
-	} else {
-		entry.InstalledAt = now
-	}
-	entry.UpdatedAt = now
-	lock.Skills[skillName] = entry
-	return WriteSkillLock(lock)
-}
-
-func RemoveSkillFromLock(skillName string) error {
-	lock := ReadSkillLock()
-	if _, ok := lock.Skills[skillName]; !ok {
-		return nil
-	}
-	delete(lock.Skills, skillName)
-	return WriteSkillLock(lock)
-}
-
-func IsPromptDismissed(key string) bool {
-	lock := ReadSkillLock()
-	if key == "findSkillsPrompt" {
-		return lock.Dismissed.FindSkillsPrompt
-	}
-	return false
-}
-
-func DismissPrompt(key string) error {
-	lock := ReadSkillLock()
-	if key == "findSkillsPrompt" {
-		lock.Dismissed.FindSkillsPrompt = true
-	}
-	return WriteSkillLock(lock)
-}
-
-func GetGitHubToken() string {
-	return os.Getenv("GITHUB_TOKEN")
-}
-
-// ──────────────────────────────────────────────────────────
-// Local (project) skill lock (skills-lock.json)
+// Local (project) skill lock - the skills section of mdm.lock
 // ──────────────────────────────────────────────────────────
 
 const localLockVersion = 1
+
+// tombstoneLockVersion is the version v2's migration tombstone carries in
+// skills-lock.json. v1.93.0 and later refuse it; older v1 releases read it as
+// an empty lock and, on their next `skills add`, rewrite the file at that same
+// version with real entries and without the _moved marker. Such a file is v1
+// data wearing the tombstone's version, so both readers below accept it.
+const tombstoneLockVersion = 2
 
 type LocalSkillLockEntry struct {
 	Source     string `json:"source"`
@@ -166,54 +27,92 @@ type LocalSkillLockEntry struct {
 	SkillPath  string `json:"skillPath,omitempty"`
 }
 
-type LocalSkillLockFile struct {
-	Version          int                            `json:"version"`
-	Skills           map[string]LocalSkillLockEntry `json:"skills"`
-	ConfiguredAgents []string                       `json:"configuredAgents,omitempty"`
+// AgentLockEntry records one installed agent-definition file. It mirrors
+// LocalSkillLockEntry, plus AgentPath, where the file sat inside the source
+// tree. AgentPath has no omitempty: a definition is a single file with no
+// well-known name like SKILL.md, so losing the path makes the entry impossible
+// to refresh. Format is the shape of the canonical file, which mirrors the
+// source, so the canonical file's extension need never be guessed. It is
+// omitempty, and absent means markdown: every canonical file written before
+// this field existed is a .md. Harnesses names the harnesses mdm wrote the
+// definition into, so remove, update, install and list act on those files and
+// no others: a same-named file in a harness the user never asked for is the
+// user's. It is omitempty because entries written before it existed have no
+// list, and the commands fall back to inferring one from the disk for those.
+type AgentLockEntry struct {
+	Source     string   `json:"source"`
+	SourceType string   `json:"sourceType"`
+	Ref        string   `json:"ref,omitempty"`
+	AgentPath  string   `json:"agentPath"`
+	Format     string   `json:"format,omitempty"`
+	Harnesses  []string `json:"harnesses,omitempty"`
 }
 
-func GetLocalLockPath(cwd string) string {
+// LocalSkillLockFile is a view of the skills section of the project lock.
+// json.Unmarshal into this struct is also how readLegacySkillsLockE reads a real
+// v1 skills-lock.json, so ConfiguredHarnesses keeps the v1 tag configuredAgents.
+// v1 is frozen and in the wild. Writes go through ProjectLockFile, which owns
+// the v2 configuredHarnesses key, so the v1 tag costs nothing on write.
+type LocalSkillLockFile struct {
+	Version             int                            `json:"version"`
+	Skills              map[string]LocalSkillLockEntry `json:"skills"`
+	ConfiguredHarnesses []string                       `json:"configuredAgents,omitempty"`
+}
+
+// legacyTombstone reports whether a legacy file is v2's own migration
+// tombstone (carrying a _moved pointer) rather than v1 data.
+func legacyTombstone(data []byte) bool {
+	var t struct {
+		Moved string `json:"_moved"`
+	}
+	return json.Unmarshal(data, &t) == nil && t.Moved != ""
+}
+
+// readLegacySkillsLockE reads the v1 skills-lock.json directly, only when
+// mdm.lock does not exist. Corrupt or newer-versioned files are an error, as in
+// the final v1 patch releases, except v2's own tombstone, which reads as empty.
+func readLegacySkillsLockE(cwd string) (LocalSkillLockFile, error) {
 	if cwd == "" {
 		cwd, _ = os.Getwd()
 	}
-	return filepath.Join(cwd, "skills-lock.json")
-}
-
-func ReadLocalLock(cwd string) LocalSkillLockFile {
-	path := GetLocalLockPath(cwd)
+	path := filepath.Join(cwd, "skills-lock.json")
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return EmptyLocalLock()
+		if os.IsNotExist(err) {
+			return EmptyLocalLock(), nil
+		}
+		return EmptyLocalLock(), errUnreadableLock(path, err)
+	}
+	if legacyTombstone(data) {
+		return EmptyLocalLock(), nil
 	}
 	var lock LocalSkillLockFile
 	if err := json.Unmarshal(data, &lock); err != nil {
-		fatalUnreadableLock(path, err)
+		return EmptyLocalLock(), errUnreadableLock(path, err)
 	}
-	if lock.Version > localLockVersion {
-		fatalNewerLock(path, lock.Version, localLockVersion)
+	if lock.Version > localLockVersion && lock.Version != tombstoneLockVersion {
+		return EmptyLocalLock(), errNewerLock(path, lock.Version, localLockVersion)
 	}
 	if lock.Skills == nil || lock.Version < localLockVersion {
-		return EmptyLocalLock()
+		return EmptyLocalLock(), nil
 	}
-	return lock
+	return lock, nil
+}
+
+func ReadLocalLock(cwd string) LocalSkillLockFile {
+	pl := ReadProjectLock(cwd)
+	return LocalSkillLockFile{
+		Version:             localLockVersion,
+		Skills:              pl.Skills,
+		ConfiguredHarnesses: pl.ConfiguredHarnesses,
+	}
 }
 
 func WriteLocalLock(lock LocalSkillLockFile, cwd string) error {
-	// Sort keys for deterministic output
-	sorted := LocalSkillLockFile{Version: lock.Version, Skills: map[string]LocalSkillLockEntry{}, ConfiguredAgents: lock.ConfiguredAgents}
-	keys := make([]string, 0, len(lock.Skills))
-	for k := range lock.Skills {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		sorted.Skills[k] = lock.Skills[k]
-	}
-	data, err := json.MarshalIndent(sorted, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(GetLocalLockPath(cwd), append(data, '\n'), 0600)
+	pl := ReadProjectLock(cwd)
+	pl.Skills = lock.Skills
+	pl.ConfiguredHarnesses = lock.ConfiguredHarnesses
+	return WriteProjectLock(pl, cwd)
 }
 
 func EmptyLocalLock() LocalSkillLockFile {
@@ -235,11 +134,38 @@ func RemoveSkillFromLocalLock(skillName string, cwd string) error {
 	return WriteLocalLock(lock, cwd)
 }
 
+// AddAgentToLocalLock records one installed agent definition in mdm.lock. It
+// goes through ProjectLockFile directly: the LocalSkillLockFile view carries
+// only the skills and configuredHarnesses sections across a round trip.
+func AddAgentToLocalLock(name string, entry AgentLockEntry, cwd string) error {
+	pl := ReadProjectLock(cwd)
+	if pl.Agents == nil {
+		pl.Agents = map[string]AgentLockEntry{}
+	}
+	pl.Agents[name] = entry
+	return WriteProjectLock(pl, cwd)
+}
+
+// RemoveAgentFromLocalLock removes one agent definition's entry from
+// mdm.lock, mirroring RemoveSkillFromLocalLock.
+func RemoveAgentFromLocalLock(name string, cwd string) error {
+	pl := ReadProjectLock(cwd)
+	if _, ok := pl.Agents[name]; !ok {
+		return nil
+	}
+	delete(pl.Agents, name)
+	return WriteProjectLock(pl, cwd)
+}
+
 func HasProjectSkills(cwd string) bool {
 	if cwd == "" {
 		cwd, _ = os.Getwd()
 	}
-	if _, err := os.Stat(filepath.Join(cwd, "skills-lock.json")); err == nil {
+	if _, err := os.Stat(filepath.Join(cwd, ProjectLockName)); err == nil {
+		return true
+	}
+	// A migration tombstone is a pointer, not project skills.
+	if data, err := os.ReadFile(filepath.Join(cwd, "skills-lock.json")); err == nil && !legacyTombstone(data) {
 		return true
 	}
 	skillsDir := filepath.Join(cwd, ".agents", "skills")
@@ -257,29 +183,51 @@ func HasProjectSkills(cwd string) bool {
 	return false
 }
 
-// GetConfiguredAgents returns the configured agent list for the given scope.
-func GetConfiguredAgents(global bool, cwd string) []string {
+// GetConfiguredHarnesses returns the configured harness list for the given scope.
+func GetConfiguredHarnesses(global bool, cwd string) []string {
 	if global {
-		return ReadSkillLock().ConfiguredAgents
+		return ReadGlobalState().ConfiguredHarnesses
 	}
-	return ReadLocalLock(cwd).ConfiguredAgents
+	return ReadLocalLock(cwd).ConfiguredHarnesses
 }
 
-// SetConfiguredAgents replaces the configured agent list for the given scope.
-func SetConfiguredAgents(agents []string, global bool, cwd string) error {
+// SetConfiguredHarnesses replaces the configured harness list for the given scope.
+func SetConfiguredHarnesses(harnesses []string, global bool, cwd string) error {
 	if global {
-		lk := ReadSkillLock()
-		lk.ConfiguredAgents = agents
-		return WriteSkillLock(lk)
+		lk := ReadGlobalState()
+		lk.ConfiguredHarnesses = harnesses
+		return WriteGlobalState(lk)
 	}
 	lk := ReadLocalLock(cwd)
-	lk.ConfiguredAgents = agents
+	lk.ConfiguredHarnesses = harnesses
 	return WriteLocalLock(lk, cwd)
 }
 
-// AddToConfiguredAgents appends agents that aren't already in the list.
-func AddToConfiguredAgents(toAdd []string, global bool, cwd string) error {
-	current := GetConfiguredAgents(global, cwd)
+// GetInstallMode returns the scope's recorded install mode. An empty string
+// means symlink, the default for a scope that never set the switch.
+func GetInstallMode(global bool, cwd string) string {
+	if global {
+		return ReadGlobalState().InstallMode
+	}
+	return ReadProjectLock(cwd).InstallMode
+}
+
+// SetInstallMode records the scope's install mode. It goes through the project
+// lock directly, since the LocalSkillLockFile view drops other sections.
+func SetInstallMode(mode string, global bool, cwd string) error {
+	if global {
+		s := ReadGlobalState()
+		s.InstallMode = mode
+		return WriteGlobalState(s)
+	}
+	lk := ReadProjectLock(cwd)
+	lk.InstallMode = mode
+	return WriteProjectLock(lk, cwd)
+}
+
+// AddToConfiguredHarnesses appends harnesses that aren't already in the list.
+func AddToConfiguredHarnesses(toAdd []string, global bool, cwd string) error {
+	current := GetConfiguredHarnesses(global, cwd)
 	existing := map[string]bool{}
 	for _, a := range current {
 		existing[a] = true
@@ -291,12 +239,12 @@ func AddToConfiguredAgents(toAdd []string, global bool, cwd string) error {
 		}
 	}
 	sort.Strings(current)
-	return SetConfiguredAgents(current, global, cwd)
+	return SetConfiguredHarnesses(current, global, cwd)
 }
 
-// RemoveFromConfiguredAgents removes the given agents from the configured list.
-func RemoveFromConfiguredAgents(toRemove []string, global bool, cwd string) error {
-	current := GetConfiguredAgents(global, cwd)
+// RemoveFromConfiguredHarnesses removes the given harnesses from the configured list.
+func RemoveFromConfiguredHarnesses(toRemove []string, global bool, cwd string) error {
+	current := GetConfiguredHarnesses(global, cwd)
 	removeSet := map[string]bool{}
 	for _, a := range toRemove {
 		removeSet[a] = true
@@ -307,5 +255,5 @@ func RemoveFromConfiguredAgents(toRemove []string, global bool, cwd string) erro
 			result = append(result, a)
 		}
 	}
-	return SetConfiguredAgents(result, global, cwd)
+	return SetConfiguredHarnesses(result, global, cwd)
 }

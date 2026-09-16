@@ -8,9 +8,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/sethcarney/mdm/internal/agent"
 	"github.com/sethcarney/mdm/internal/fork"
 	"github.com/sethcarney/mdm/internal/git"
+	"github.com/sethcarney/mdm/internal/harness"
 	"github.com/sethcarney/mdm/internal/lock"
 	"github.com/sethcarney/mdm/internal/skill"
 	"github.com/sethcarney/mdm/internal/source"
@@ -26,11 +26,12 @@ type CherryPickOptions struct {
 	Dir              string
 	Skills           []string
 	As               string
-	Agents           []string
+	Harnesses        []string
 	Install          bool
 	Global           bool
 	Project          bool
 	Copy             bool
+	Symlink          bool
 	Yes              bool
 	Force            bool
 	DryRun           bool
@@ -51,7 +52,7 @@ func buildCherryPickCmd(ver string) *cobra.Command {
 		Long: fmt.Sprintf(`Copy selected skills out of someone else's repository and into your own,
 so you can edit them and ship them as yours.
 
-Unlike %smdm skills add%s - which installs a skill into each agent's skills
+Unlike %smdm skills add%s - which installs a skill into each harness's skills
 directory and tracks the upstream source so %smdm skills update%s can replace it
 - cherry-pick vendors the skill into ./%s, where it becomes part of your
 repository. Nothing overwrites it afterwards; divergence from upstream is the
@@ -71,7 +72,7 @@ find and warns when a source declares no license at all, but honouring the terms
   mdm skills cherry-pick owner/repo#v1.2.0 -s code-review
   mdm skills cherry-pick owner/repo -s code-review --as our-code-review
   mdm skills cherry-pick ./.agents/skills/code-review     # fork one you already installed
-  mdm skills cherry-pick owner/repo -s code-review --install -a claude-code
+  mdm skills cherry-pick owner/repo -s code-review --install --harness claude-code
   mdm skills cherry-pick --status`,
 			ansiBold, ansiReset, ansiBold, ansiReset, defaultForksDir,
 			ansiText, fork.OriginFileName, ansiReset,
@@ -92,7 +93,7 @@ find and warns when a source declares no license at all, but honouring the terms
 				fmt.Printf("  %s$%s mdm skills cherry-pick --status\n\n", ansiDim, ansiReset)
 				os.Exit(1)
 			}
-			if len(opts.Agents) > 0 {
+			if len(opts.Harnesses) > 0 {
 				opts.Install = true
 			}
 			runCherryPick(args[0], opts)
@@ -103,11 +104,12 @@ find and warns when a source declares no license at all, but honouring the terms
 	f.StringVarP(&opts.Dir, "dir", "d", defaultForksDir, "Directory to fork skills into (relative to the project root)")
 	f.StringArrayVarP(&opts.Skills, "skill", "s", nil, "Skill names to fork (repeatable, use '*' for all)")
 	f.StringVar(&opts.As, "as", "", "Rename the forked skill (single skill only)")
-	f.BoolVarP(&opts.Install, "install", "i", false, "Also install the forks into your agents' skills directories")
-	f.StringArrayVarP(&opts.Agents, "agent", "a", nil, "Agents to install the forks to (implies --install)")
+	f.BoolVarP(&opts.Install, "install", "i", false, "Also install the forks into your harnesses' skills directories")
+	f.StringArrayVar(&opts.Harnesses, "harness", nil, "Harnesses to install the forks to (implies --install)")
 	f.BoolVarP(&opts.Global, "global", "g", false, "Install the forks globally (with --install)")
 	f.BoolVarP(&opts.Project, "project", "p", false, "Install the forks for this project only (with --install)")
-	f.BoolVar(&opts.Copy, "copy", false, "Copy files instead of symlinking (with --install)")
+	f.BoolVar(&opts.Copy, "copy", false, "Copy files instead of symlinking (with --install; switches the scope to copy mode)")
+	f.BoolVar(&opts.Symlink, "symlink", false, "Symlink files from .agents/skills (with --install; the default, switches a scope back from copy mode)")
 	f.BoolVarP(&opts.Yes, "yes", "y", false, "Skip confirmation prompts")
 	f.BoolVar(&opts.Force, "force", false, "Replace an existing fork, discarding local edits")
 	f.BoolVar(&opts.DryRun, "dry-run", false, "Show what would be forked without writing anything")
@@ -117,7 +119,9 @@ find and warns when a source declares no license at all, but honouring the terms
 	f.BoolVar(&opts.AllowHiddenChars, "allow-hidden-chars", false, "Allow markdown files with hidden Unicode characters")
 	f.BoolVar(&opts.NoAttribution, "no-attribution", false, "Do not write "+fork.AttributionFileName+" (you remain responsible for the license terms)")
 
-	_ = cmd.RegisterFlagCompletionFunc("agent", agentFlagCompletion)
+	cmd.MarkFlagsMutuallyExclusive("copy", "symlink")
+
+	_ = cmd.RegisterFlagCompletionFunc("harness", harnessFlagCompletion)
 
 	return cmd
 }
@@ -441,7 +445,7 @@ func installedSkillOrigin(skillName, cwd string) (lock.LocalSkillLockEntry, bool
 	if e, ok := lock.ReadLocalLock(cwd).Skills[key]; ok && isRemoteSourceType(e.SourceType) {
 		return e, true
 	}
-	if e, ok := lock.ReadSkillLock().Skills[key]; ok && isRemoteSourceType(e.SourceType) {
+	if e, ok := lock.ReadGlobalState().Skills[key]; ok && isRemoteSourceType(e.SourceType) {
 		return lock.LocalSkillLockEntry{
 			Source:     e.Source,
 			Ref:        e.Ref,
@@ -471,7 +475,7 @@ func printCherryPickSummary(forked []string, licenses map[string]licenseInfo, op
 	fmt.Printf("  them like any other source in this repository.%s\n\n", ansiReset)
 
 	if !opts.Install {
-		fmt.Printf("  %sInstall them into your agents with:%s\n", ansiDim, ansiReset)
+		fmt.Printf("  %sInstall them into your harnesses with:%s\n", ansiDim, ansiReset)
 		fmt.Printf("  %s$%s mdm skills add %s\n\n", ansiDim, ansiReset, dir)
 	}
 	if opts.NoAttribution {
@@ -489,18 +493,18 @@ func printCherryPickSummary(forked []string, licenses map[string]licenseInfo, op
 	}
 }
 
-// clobbersForks reports whether installing to this agent would write over the
-// forks directory itself. Installing a skill replaces the agent's <skills
+// clobbersForks reports whether installing to this harness would write over the
+// forks directory itself. Installing a skill replaces the harness's <skills
 // dir>/<name>, so when that directory is the forks directory - OpenClaw reads
 // ./skills, mdm's own default - the install would destroy the very source it is
 // installing from.
-func clobbersForks(agentName string, global bool, cwd, forksRoot string) bool {
+func clobbersForks(harnessName string, global bool, cwd, forksRoot string) bool {
 	forksAbs, err := filepath.Abs(forksRoot)
 	if err != nil {
 		return false
 	}
 	forksAbs = filepath.Clean(forksAbs)
-	for _, base := range []string{getAgentBaseDir(agentName, global, cwd), getCanonicalSkillsDir(global, cwd)} {
+	for _, base := range []string{getHarnessBaseDir(harnessName, global, cwd), getCanonicalSkillsDir(global, cwd)} {
 		if base == "" {
 			continue
 		}
@@ -515,14 +519,14 @@ func clobbersForks(agentName string, global bool, cwd, forksRoot string) bool {
 	return false
 }
 
-// dropClobberingAgents removes agents that read the forks directory directly.
+// dropClobberingHarnesses removes harnesses that read the forks directory directly.
 // They need no install: the fork is already sitting where they look for skills.
-func dropClobberingAgents(agents []string, global bool, cwd, forksRoot string) []string {
-	kept := make([]string, 0, len(agents))
-	for _, name := range agents {
+func dropClobberingHarnesses(harnesses []string, global bool, cwd, forksRoot string) []string {
+	kept := make([]string, 0, len(harnesses))
+	for _, name := range harnesses {
 		if clobbersForks(name, global, cwd, forksRoot) {
 			display := name
-			if a := agent.AllAgents[name]; a != nil {
+			if a := harness.AllHarnesses[name]; a != nil {
 				display = a.DisplayName
 			}
 			ui.LogInfo(fmt.Sprintf("%s already reads %s - skipping its install so the fork is not overwritten",
@@ -546,13 +550,15 @@ func installForks(forked []string, opts CherryPickOptions, cwd string) {
 		return
 	}
 
-	global, mode, agents, ok := promptScopeAndAgents(AddOptions{
-		Global:  opts.Global,
-		Project: opts.Project,
-		Agents:  opts.Agents,
-		Yes:     opts.Yes,
-		Copy:    opts.Copy,
-	}, cwd)
+	addOpts := AddOptions{
+		Global:    opts.Global,
+		Project:   opts.Project,
+		Harnesses: opts.Harnesses,
+		Yes:       opts.Yes,
+		Copy:      opts.Copy,
+		Symlink:   opts.Symlink,
+	}
+	global, harnesses, ok := promptScopeAndHarnesses(addOpts, cwd)
 	if !ok {
 		return
 	}
@@ -561,16 +567,26 @@ func installForks(forked []string, opts CherryPickOptions, cwd string) {
 	// these skills now update from your copy, and `mdm skills update` skips
 	// local sources entirely, so nothing upstream can overwrite your edits.
 	forksRoot := filepath.Join(cwd, opts.Dir)
-	if agents = dropClobberingAgents(agents, global, cwd, forksRoot); len(agents) == 0 {
+	if harnesses = dropClobberingHarnesses(harnesses, global, cwd, forksRoot); len(harnesses) == 0 {
+		return
+	}
+
+	// After the clobber filter: a harness list it empties means nothing gets
+	// installed, and a scope converted for an install that never happens is
+	// exactly the mix this switch exists to avoid.
+	mode, ok := commitScopeInstallMode(addOpts, global, cwd)
+	if !ok {
 		return
 	}
 
 	fmt.Println()
-	installSkillsForAgents(skills, agents, global, mode, lock.SkillLockEntry{
+	if installSkillsForHarnesses(skills, harnesses, global, mode, lock.SkillLockEntry{
 		Source:     forksRoot,
 		SourceType: string(source.SourceTypeLocal),
 		SourceURL:  forksRoot,
-	}, cwd, "")
+	}, cwd, "") == 0 {
+		os.Exit(1)
+	}
 }
 
 // ─── Status ────────────────────────────────────────────────────────────────────

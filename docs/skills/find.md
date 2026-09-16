@@ -16,6 +16,7 @@ Aliases: `search`, `f`, `s`
 
 | Flag     | Description                                       |
 | -------- | ------------------------------------------------- |
+| `--source` | List the skills available at a remote source (e.g. `owner/repo`) without installing, instead of searching the registry |
 | `--json` | Print results as a JSON array and exit without installing (CI / scripting use) |
 
 ## Flow
@@ -23,7 +24,7 @@ Aliases: `search`, `f`, `s`
 1. Enter a search query (or pass it as an argument).
 2. A spinner shows while results are fetched.
 3. A multiselect list shows matching skills with their descriptions and star counts.
-4. Selecting skills runs `mdm skills add` for each one, letting you choose scope and agents.
+4. Selecting skills runs `mdm skills add` for each one, letting you choose scope and harnesses.
 
 ```
 Search skills: typescript

@@ -3,125 +3,183 @@ package commands
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
 
-	"github.com/sethcarney/mdm/internal/experimental"
 	"github.com/sethcarney/mdm/internal/lock"
 	"github.com/sethcarney/mdm/internal/ui"
 )
 
+// skillRestoredOnDisk reports whether a skill's canonical directory is present
+// after a restore. The lock key is the sanitized name, which is also the
+// canonical directory name, and copy mode materializes the canonical directory
+// too, so its presence is the signal that the source still had the skill.
+func skillRestoredOnDisk(name string, global bool, cwd string) bool {
+	_, err := os.Stat(filepath.Join(getCanonicalSkillsDir(global, cwd), name))
+	return err == nil
+}
+
+// restoreOptions carries what `mdm skills install` was asked for. The mode
+// flags belong here too: install is the command that restores a scope which
+// already exists, so it is where a user changes the mode of one.
+type restoreOptions struct {
+	yes              bool
+	allowHiddenChars bool
+	copy             bool
+	symlink          bool
+}
+
 func buildInstallFromLockCmd(ver string) *cobra.Command {
-	var yes bool
-	var allowHiddenChars bool
+	var opts restoreOptions
 
 	cmd := &cobra.Command{
 		Use:   "install",
-		Short: "Restore skills from skills-lock.json",
-		Args:  cobra.NoArgs,
+		Short: "Restore skills, then agent definitions, from " + lockName,
+		Long: `Restore every skill recorded in ` + lockName + `, then every agent
+definition recorded there too, each re-fetched from its original source
+and ref. Intended for CI and onboarding - run it after cloning a repo to
+get everything back without remembering each package source.`,
+		Args: cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
 			showLogo(ver)
-			runInstallFromLock(yes, allowHiddenChars)
+			runInstallFromLock(opts)
+			// A restore that could not install everything the lock describes
+			// has to say so in its exit code, or CI treats a half-provisioned
+			// checkout as a good one.
+			if restoreFailed {
+				os.Exit(1)
+			}
 		},
 	}
 
-	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip confirmation prompts")
-	cmd.Flags().BoolVar(&allowHiddenChars, "allow-hidden-chars", false, "Allow markdown files with hidden Unicode characters")
+	cmd.Flags().BoolVarP(&opts.yes, "yes", "y", false, "Skip confirmation prompts")
+	cmd.Flags().BoolVar(&opts.allowHiddenChars, "allow-hidden-chars", false, "Allow markdown files with hidden Unicode characters")
+	cmd.Flags().BoolVar(&opts.copy, "copy", false, "Copy files instead of symlinking (switches the scope to copy mode)")
+	cmd.Flags().BoolVar(&opts.symlink, "symlink", false, "Symlink files from .agents/skills (the default; switches a scope back from copy mode)")
+	// The install mode is one switch with two settings, so asking for
+	// both is a contradiction rather than a precedence puzzle.
+	cmd.MarkFlagsMutuallyExclusive("copy", "symlink")
 	return cmd
 }
 
 // hintPluginsInstall points at `mdm plugins install` when the project has a
-// plugins-lock.json - plugin restore is a separate command with its own lock.
+// plugin section in its lock - plugin restore is a separate command.
 func hintPluginsInstall(cwd string) {
 	if len(lock.ReadPluginsLock(cwd).Plugins) == 0 {
 		return
 	}
-	if experimental.Enabled(experimental.Plugins) {
-		fmt.Printf("%sThis project also has plugins - restore them with 'mdm plugins install'.%s\n", ansiDim, ansiReset)
-		return
-	}
-	fmt.Printf("%sThis project has a plugins-lock.json - enable plugin support with 'mdm experimental enable plugins', then run 'mdm plugins install'.%s\n", ansiDim, ansiReset)
+	fmt.Printf("%sThis project also has plugins - restore them with 'mdm plugins install'.%s\n", ansiDim, ansiReset)
 }
 
-func runInstallFromLock(yes bool, allowHiddenChars bool) {
+// restoreSkillsHook and restoreAgentsHook are runInstallFromLock's two restore
+// steps, as swappable vars. Neither step leaves an on-disk trace a unit test
+// can assert on, so tests swap these for recorders to pin down the order.
+var (
+	restoreSkillsHook = restoreSkillsFromCurrentLock
+	restoreAgentsHook = restoreAgentsFromLock
+)
+
+func runInstallFromLock(opts restoreOptions) {
 	cwd, _ := os.Getwd()
 	hintPluginsInstall(cwd)
 
+	restoreSkillsHook(opts, cwd)
+	restoreAgentsHook(opts)
+}
+
+// restoreSkillsFromCurrentLock is `mdm install`'s skill-restore step:
+// local-vs-global resolution, and the "which lock file" prompt when both are
+// populated.
+func restoreSkillsFromCurrentLock(opts restoreOptions, cwd string) {
 	localL := lock.ReadLocalLock(cwd)
-	globalL := lock.ReadSkillLock()
+	globalL := lock.ReadGlobalState()
 
 	hasLocal := len(localL.Skills) > 0
 	hasGlobal := len(globalL.Skills) > 0
+	hasAgents := len(lock.ReadProjectLock(cwd).Agents) > 0 || len(globalL.Agents) > 0
 	vlog(verboseFlag, "install from lock: local=%d skill(s) global=%d skill(s)", len(localL.Skills), len(globalL.Skills))
 
 	switch {
 	case !hasLocal && !hasGlobal:
-		fmt.Printf("\n%sNo skills-lock.json found.%s\n\n", ansiDim, ansiReset)
+		// A lock holding only agent definitions is still a lock. The agent
+		// restore step reports those, so announcing there is none here - and
+		// pointing at `mdm skills add` - would be wrong.
+		if hasAgents {
+			return
+		}
+		fmt.Printf("\n%sNo %s found.%s\n\n", ansiDim, lockName, ansiReset)
 		fmt.Printf("Add skills with %smdm skills add <package>%s\n\n", ansiText, ansiReset)
 
-	case hasLocal && !hasGlobal:
-		// Only local lock has skills - restore silently
-		restoreFromLocalLock(localL, yes, allowHiddenChars)
-
-	case !hasLocal && hasGlobal:
-		// Only global lock has skills - explain and ask
-		fmt.Printf("\n%sNo skills found in local skills-lock.json.%s\n", ansiDim, ansiReset)
-		fmt.Printf("%sFound %d skill(s) in global skills-lock.json (%s).%s\n\n",
-			ansiDim, len(globalL.Skills), lock.GetSkillLockPath(), ansiReset)
-		if !yes {
-			confirmed, ok := ui.UiConfirm("Install from global skills-lock.json?")
-			if !ok || !confirmed {
-				fmt.Println("Cancelled.")
-				return
-			}
+	default:
+		global, ok := chooseRestoreScope(len(localL.Skills), len(globalL.Skills), opts.yes, "skill", cwd)
+		if !ok {
+			fmt.Println("Cancelled.")
+			return
 		}
-		restoreFromGlobalLock(globalL, yes, allowHiddenChars)
-
-	default: // both have skills
-		if yes {
-			// Default to local when -y flag is used
-			restoreFromLocalLock(localL, yes, allowHiddenChars)
+		if global {
+			restoreFromGlobalLock(globalL, opts)
 		} else {
-			idx, ok := ui.UiSelect("Install from which skills-lock.json?", []ui.UIOption{
-				{Label: fmt.Sprintf("Local  - %d skill(s)", len(localL.Skills)), Hint: lock.GetLocalLockPath(cwd)},
-				{Label: fmt.Sprintf("Global - %d skill(s)", len(globalL.Skills)), Hint: lock.GetSkillLockPath()},
-			})
-			if !ok {
-				fmt.Println("Cancelled.")
-				return
-			}
-			if idx == 1 {
-				restoreFromGlobalLock(globalL, yes, allowHiddenChars)
-			} else {
-				restoreFromLocalLock(localL, yes, allowHiddenChars)
-			}
+			restoreFromLocalLock(localL, opts)
 		}
 	}
 }
 
+// chooseRestoreScope decides which lock a restore reads when at least one of
+// the two records something: the only populated one, with a confirmation
+// when that is the global state file (which a project checkout does not
+// imply); under --yes the local lock when both are populated; otherwise the
+// user's choice. noun is the singular of what is being restored.
+func chooseRestoreScope(localCount, globalCount int, yes bool, noun, cwd string) (global bool, ok bool) {
+	switch {
+	case localCount > 0 && globalCount == 0:
+		return false, true
+	case localCount == 0 && globalCount > 0:
+		fmt.Printf("\n%sNo %ss found in the local %s.%s\n", ansiDim, noun, lockName, ansiReset)
+		fmt.Printf("%sFound %d %s(s) in the global state file (%s).%s\n\n",
+			ansiDim, globalCount, noun, lock.GetGlobalStatePath(), ansiReset)
+		if yes {
+			return true, true
+		}
+		confirmed, ok := ui.UiConfirm(fmt.Sprintf("Install from the globally recorded %ss?", noun))
+		return true, ok && confirmed
+	}
+	if yes {
+		return false, true
+	}
+	idx, ok := ui.UiSelect("Install from which lock file?", []ui.UIOption{
+		{Label: fmt.Sprintf("Local  - %d %s(s)", localCount, noun), Hint: lock.GetProjectLockPath(cwd)},
+		{Label: fmt.Sprintf("Global - %d %s(s)", globalCount, noun), Hint: lock.GetGlobalStatePath()},
+	})
+	if !ok {
+		return false, false
+	}
+	return idx == 1, true
+}
+
 // restoreFromLocalLock installs all skills recorded in the project-level lock file.
-func restoreFromLocalLock(l lock.LocalSkillLockFile, yes bool, allowHiddenChars bool) {
-	fmt.Printf("\n%sRestoring %d skill(s) from local skills-lock.json...%s\n\n", ansiText, len(l.Skills), ansiReset)
+func restoreFromLocalLock(l lock.LocalSkillLockFile, opts restoreOptions) {
+	fmt.Printf("\n%sRestoring %d skill(s) from the local %s...%s\n\n", ansiText, len(l.Skills), lockName, ansiReset)
 
 	// Convert local entries to a common source/ref map.
 	entries := make(map[string]sourceRef, len(l.Skills))
 	for name, e := range l.Skills {
 		entries[name] = sourceRef{source: e.Source, ref: e.Ref}
 	}
-	restoreSkills(entries, AddOptions{Project: true, Yes: yes, AllowHiddenChars: allowHiddenChars})
+	restoreSkills(entries, AddOptions{Project: true, Yes: opts.yes, AllowHiddenChars: opts.allowHiddenChars, Copy: opts.copy, Symlink: opts.symlink})
 }
 
 // restoreFromGlobalLock installs all skills recorded in the global lock file.
-func restoreFromGlobalLock(l lock.SkillLockFile, yes bool, allowHiddenChars bool) {
-	fmt.Printf("\n%sRestoring %d skill(s) from global skills-lock.json...%s\n\n", ansiText, len(l.Skills), ansiReset)
+func restoreFromGlobalLock(l lock.GlobalState, opts restoreOptions) {
+	fmt.Printf("\n%sRestoring %d skill(s) from the global state file...%s\n\n", ansiText, len(l.Skills), ansiReset)
 
 	entries := make(map[string]sourceRef, len(l.Skills))
 	for name, e := range l.Skills {
 		entries[name] = sourceRef{source: e.Source, ref: e.Ref}
 	}
-	restoreSkills(entries, AddOptions{Global: true, Yes: yes, AllowHiddenChars: allowHiddenChars})
+	restoreSkills(entries, AddOptions{Global: true, Yes: opts.yes, AllowHiddenChars: opts.allowHiddenChars, Copy: opts.copy, Symlink: opts.symlink})
 }
 
 // sourceRef holds the source URL/path and optional ref for a lock entry.
@@ -130,13 +188,19 @@ type sourceRef struct {
 	ref    string
 }
 
-// restoreSkills groups lock entries by source and calls runAdd for each group.
-func restoreSkills(entries map[string]sourceRef, baseOpts AddOptions) {
-	type sourceGroup struct {
-		source string
-		ref    string
-		skills []string
-	}
+// sourceGroup is a set of lock entries (names only - skill names, agent
+// definition names, whatever the caller is restoring) that resolve to the
+// same source at the same target ref. Every group costs exactly one fetch.
+type sourceGroup struct {
+	source string
+	ref    string
+	names  []string
+}
+
+// groupBySourceRef buckets entries by normalized source+ref, so restoring or
+// updating several names that share a repository fetches it once. Shared by
+// restoreSkills and the agent-restore path in agent_artifacts.go.
+func groupBySourceRef(entries map[string]sourceRef) []sourceGroup {
 	sourceMap := map[string]*sourceGroup{}
 	for name, e := range entries {
 		// Normalize: strip a trailing #fragment from the source when it duplicates
@@ -152,44 +216,101 @@ func restoreSkills(entries map[string]sourceRef, baseOpts AddOptions) {
 		}
 		key := normalizedSource + "|" + e.ref
 		if g, ok := sourceMap[key]; ok {
-			g.skills = append(g.skills, name)
+			g.names = append(g.names, name)
 		} else {
-			sourceMap[key] = &sourceGroup{source: normalizedSource, ref: e.ref, skills: []string{name}}
+			sourceMap[key] = &sourceGroup{source: normalizedSource, ref: e.ref, names: []string{name}}
 		}
 	}
 
-	// Resolve agents once so the user is not prompted for each source group.
-	if len(baseOpts.Agents) == 0 {
-		cwd, _ := os.Getwd()
-		agents, ok := promptAgents(baseOpts, baseOpts.Global, cwd)
-		if !ok {
-			fmt.Println("Cancelled.")
-			return
-		}
-		baseOpts.Agents = agents
-	}
-
-	vlog(verboseFlag, "grouped %d skill(s) into %d source group(s)", len(entries), len(sourceMap))
-	// Iterate groups (and each group's skills) in sorted order so restores are
+	// Iterate groups (and each group's names) in sorted order so restores are
 	// deterministic rather than following map iteration order.
 	keys := make([]string, 0, len(sourceMap))
 	for key := range sourceMap {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
+	groups := make([]sourceGroup, 0, len(keys))
 	for _, key := range keys {
-		group := sourceMap[key]
-		sort.Strings(group.skills)
-		vlog(verboseFlag, "restoring from %q (ref=%q): %v", group.source, group.ref, group.skills)
+		g := sourceMap[key]
+		sort.Strings(g.names)
+		groups = append(groups, *g)
+	}
+	return groups
+}
+
+// restoreSkills groups lock entries by source and calls runAdd for each group.
+func restoreSkills(entries map[string]sourceRef, baseOpts AddOptions) {
+	groups := groupBySourceRef(entries)
+
+	// Resolve harnesses once so the user is not prompted for each source group.
+	if len(baseOpts.Harnesses) == 0 {
+		cwd, _ := os.Getwd()
+		harnesses, ok := promptHarnesses(baseOpts, baseOpts.Global, cwd)
+		if !ok {
+			fmt.Println("Cancelled.")
+			return
+		}
+		baseOpts.Harnesses = harnesses
+	}
+
+	cwd, _ := os.Getwd()
+	vlog(verboseFlag, "grouped %d skill(s) into %d source group(s)", len(entries), len(groups))
+	var unrestorable []string
+	for _, group := range groups {
+		vlog(verboseFlag, "restoring from %q (ref=%q): %v", group.source, group.ref, group.names)
+		// A source this machine cannot reach is reported and skipped. The
+		// install path exits the process on a missing local path, which would
+		// take every other skill in the lock down with it - the opposite of
+		// what a restore is for.
+		if why := unreachableLocalSource(group.source, cwd); why != "" {
+			for _, name := range group.names {
+				ui.LogWarn(fmt.Sprintf("%s: %s", name, why))
+				unrestorable = append(unrestorable, name)
+			}
+			continue
+		}
 		fmt.Printf("%sInstalling from %s...%s\n", ansiDim, group.source, ansiReset)
 		opts := baseOpts
-		opts.Skills = group.skills
+		opts.Skills = group.names
+		opts.RestoreMode = true
 		src := group.source
 		if group.ref != "" && !strings.Contains(src, "#") {
 			src = src + "#" + group.ref
 		}
 		runAdd(src, opts)
+
+		// runAdd cannot report which names it restored, so confirm each expected
+		// skill actually landed: a name the lock records but the source no longer
+		// yields leaves no canonical directory, and RestoreMode kept runAdd from
+		// exiting the process over it, so the loop reaches the others.
+		for _, name := range group.names {
+			if !skillRestoredOnDisk(name, baseOpts.Global, cwd) {
+				ui.LogWarn(fmt.Sprintf("%s: not found in %s - the lock records it but the source no longer has it", name, group.source))
+				unrestorable = append(unrestorable, name)
+			}
+		}
 	}
 
+	reportUnrestorable(unrestorable, "skill",
+		"Vendor it with `mdm skills cherry-pick`, or re-add it from a source your team can reach.")
 	fmt.Printf("%sDone.%s\n\n", ansiText, ansiReset)
 }
+
+// reportUnrestorable closes a restore that skipped entries, and marks the run
+// failed. A restore that silently returns 0 having installed less than the lock
+// describes is the thing CI cannot notice.
+func reportUnrestorable(names []string, noun, hint string) {
+	if len(names) == 0 {
+		return
+	}
+	sort.Strings(names)
+	fmt.Println()
+	ui.LogError(fmt.Sprintf("%d %s(s) could not be restored on this machine: %s",
+		len(names), noun, strings.Join(names, ", ")))
+	fmt.Printf("%s  A local source outside the project is not part of the repository. %s%s\n", ansiDim, hint, ansiReset)
+	restoreFailed = true
+}
+
+// restoreFailed records that a restore skipped something, so the command can
+// exit non-zero after finishing the entries it could install.
+var restoreFailed bool

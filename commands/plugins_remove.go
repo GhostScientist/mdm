@@ -8,7 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/sethcarney/mdm/internal/agent"
+	"github.com/sethcarney/mdm/internal/harness"
 	"github.com/sethcarney/mdm/internal/lock"
 	"github.com/sethcarney/mdm/internal/ui"
 )
@@ -21,7 +21,7 @@ func buildPluginsRemoveCmd() *cobra.Command {
 		Short:   "Remove installed Agent Plugins",
 		Aliases: []string{"rm", "r"},
 		Long: fmt.Sprintf(`Remove plugins, their skill links, their MCP config entries, and their
-plugins-lock.json entries.
+%s entries.
 
 The plugin's persistent data directory is preserved unless --purge-data
 is given.
@@ -31,7 +31,7 @@ If no plugin names are provided an interactive selection menu is shown.
 %sExamples:%s
   mdm plugins remove
   mdm plugins remove toolkit -y
-  mdm plugins remove toolkit --purge-data`, ansiBold, ansiReset),
+  mdm plugins remove toolkit --purge-data`, lockName, ansiBold, ansiReset),
 		Args: cobra.ArbitraryArgs,
 		Run: func(cmd *cobra.Command, args []string) {
 			runPluginsRemove(args, yes, purgeData)
@@ -50,7 +50,7 @@ func selectPluginsToRemove(lk lock.PluginLockFile, names []string, yes bool) ([]
 			if _, ok := lk.Plugins[name]; ok {
 				keep = append(keep, name)
 			} else {
-				ui.LogWarn(fmt.Sprintf("%s is not in plugins-lock.json", name))
+				ui.LogWarn(fmt.Sprintf("%s is not in the lock file", name))
 			}
 		}
 		return keep, len(keep) > 0
@@ -125,12 +125,12 @@ func removeInstalledPlugin(name string, entry lock.PluginLockEntry, purgeData bo
 		}
 	}
 	if err := lock.RemovePluginFromLock(name, cwd); err != nil {
-		ui.LogWarn(fmt.Sprintf("could not update plugins-lock.json: %v", err))
+		ui.LogWarn(fmt.Sprintf("could not update %s: %v", lockName, err))
 	}
 	return true
 }
 
-// removePluginSkillLinks deletes the canonical and per-agent links for
+// removePluginSkillLinks deletes the canonical and per-harness links for
 // every skill the lock records for this plugin, but only when the link (or
 // its copy fallback) is actually owned by it: another plugin's symlink or
 // a skills-lock-tracked standalone install that took over the name is
@@ -152,13 +152,13 @@ func removePluginSkillLinks(pluginName string, entry lock.PluginLockEntry, cwd s
 				continue
 			}
 		}
-		for _, agentName := range entry.SkillAgents {
-			if agent.UsesSharedSkillsDir(agentName) {
+		for _, harnessName := range entry.SkillAgents {
+			if harness.UsesSharedSkillsDir(harnessName) {
 				continue
 			}
-			agentBase := getAgentBaseDir(agentName, false, cwd)
-			if agentBase != "" {
-				removeAgentSkillDir(agentBase, skillName, "")
+			harnessBase := getHarnessBaseDir(harnessName, false, cwd)
+			if harnessBase != "" {
+				_ = removeHarnessSkillDir(harnessBase, skillName, "")
 			}
 		}
 		removeCanonicalSkillDir(canonicalDir)

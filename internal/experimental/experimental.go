@@ -17,10 +17,6 @@ import (
 // Feature is a named experimental capability.
 type Feature string
 
-const Knowledge Feature = "knowledge"
-
-const Plugins Feature = "plugins"
-
 // EnvVar enables features for a single invocation without persisting
 // anything, e.g. MDM_EXPERIMENTAL=knowledge or MDM_EXPERIMENTAL=all.
 const EnvVar = "MDM_EXPERIMENTAL"
@@ -31,23 +27,30 @@ type Info struct {
 	SpecURL     string
 }
 
-// All lists every known experimental feature, in display order.
-var All = []Info{
-	{
-		Feature:     Knowledge,
-		Description: "Manage OKF knowledge bundles (mdm knowledge)",
-		SpecURL:     "https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf",
-	},
-	{
-		Feature:     Plugins,
-		Description: "Manage Agent Plugins - skills + MCP servers (mdm plugins)",
-		SpecURL:     "https://agent-plugins.org",
-	},
-}
+// All lists every known experimental feature, in display order. It is empty
+// when a release ships no experimental features - knowledge and plugins
+// graduated to full support in v2.
+var All = []Info{}
+
+// Graduated lists former experimental features that are now fully
+// supported, so their old opt-ins get a helpful answer instead of
+// "unknown feature".
+var Graduated = []string{"knowledge", "plugins"}
 
 func IsKnown(name string) bool {
 	for _, info := range All {
 		if string(info.Feature) == name {
+			return true
+		}
+	}
+	return false
+}
+
+// IsGraduated reports whether name was experimental in a previous release
+// and is now fully supported.
+func IsGraduated(name string) bool {
+	for _, g := range Graduated {
+		if g == name {
 			return true
 		}
 	}
@@ -72,7 +75,7 @@ func EnabledByEnv(f Feature) bool {
 
 // Persisted reports whether f was enabled with `mdm experimental enable`.
 func Persisted(f Feature) bool {
-	for _, name := range lock.ReadSkillLock().Experimental {
+	for _, name := range lock.ReadGlobalState().Experimental {
 		if name == string(f) {
 			return true
 		}
@@ -82,7 +85,7 @@ func Persisted(f Feature) bool {
 
 // Enable persists the opt-in for f in the global lock file.
 func Enable(f Feature) error {
-	lk := lock.ReadSkillLock()
+	lk := lock.ReadGlobalState()
 	for _, name := range lk.Experimental {
 		if name == string(f) {
 			return nil
@@ -90,13 +93,13 @@ func Enable(f Feature) error {
 	}
 	lk.Experimental = append(lk.Experimental, string(f))
 	sort.Strings(lk.Experimental)
-	return lock.WriteSkillLock(lk)
+	return lock.WriteGlobalState(lk)
 }
 
 // Disable removes the persisted opt-in for f. It does not affect
 // MDM_EXPERIMENTAL, which always wins.
 func Disable(f Feature) error {
-	lk := lock.ReadSkillLock()
+	lk := lock.ReadGlobalState()
 	kept := make([]string, 0, len(lk.Experimental))
 	for _, name := range lk.Experimental {
 		if name != string(f) {
@@ -107,5 +110,5 @@ func Disable(f Feature) error {
 		return nil
 	}
 	lk.Experimental = kept
-	return lock.WriteSkillLock(lk)
+	return lock.WriteGlobalState(lk)
 }

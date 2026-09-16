@@ -4,18 +4,16 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"sort"
 	"time"
 )
 
 // ──────────────────────────────────────────────────────────
-// Knowledge bundle lock (knowledge-lock.json, project scope)
+// Knowledge bundle lock - the knowledge section of mdm.lock
 //
-// Knowledge entries deliberately live in their own file rather than in
-// skills-lock.json: the skill locks are read into fixed structs and
-// rewritten wholesale, so an older mdm binary touching skills would
-// silently drop unknown keys. A separate file keeps the experimental
-// knowledge feature invisible to - and incorruptible by - stable binaries.
+// v1 kept knowledge entries in their own knowledge-lock.json so a stable
+// binary rewriting the skills lock could not drop them. In v2 the unified
+// mdm.lock preserves unknown top-level keys on every write (see
+// project.go), so the sections share one file safely.
 // ──────────────────────────────────────────────────────────
 
 const knowledgeLockVersion = 1
@@ -33,53 +31,48 @@ type KnowledgeLockEntry struct {
 	UpdatedAt   string `json:"updatedAt"`
 }
 
+// KnowledgeLockFile is a view of the knowledge section of the project lock.
 type KnowledgeLockFile struct {
 	Version int                           `json:"version"`
 	Bundles map[string]KnowledgeLockEntry `json:"bundles"`
 }
 
-func GetKnowledgeLockPath(cwd string) string {
+// readLegacyKnowledgeLockE reads the v1 knowledge-lock.json directly. It is
+// only consulted when mdm.lock does not exist. Corrupt or
+// newer-versioned files are an error, matching the final v1 patch releases.
+func readLegacyKnowledgeLockE(cwd string) (KnowledgeLockFile, error) {
 	if cwd == "" {
 		cwd, _ = os.Getwd()
 	}
-	return filepath.Join(cwd, "knowledge-lock.json")
-}
-
-func ReadKnowledgeLock(cwd string) KnowledgeLockFile {
-	path := GetKnowledgeLockPath(cwd)
+	path := filepath.Join(cwd, "knowledge-lock.json")
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return EmptyKnowledgeLock()
+		if os.IsNotExist(err) {
+			return EmptyKnowledgeLock(), nil
+		}
+		return EmptyKnowledgeLock(), errUnreadableLock(path, err)
 	}
 	var lk KnowledgeLockFile
 	if err := json.Unmarshal(data, &lk); err != nil {
-		fatalUnreadableLock(path, err)
+		return EmptyKnowledgeLock(), errUnreadableLock(path, err)
 	}
 	if lk.Version > knowledgeLockVersion {
-		fatalNewerLock(path, lk.Version, knowledgeLockVersion)
+		return EmptyKnowledgeLock(), errNewerLock(path, lk.Version, knowledgeLockVersion)
 	}
 	if lk.Bundles == nil || lk.Version < knowledgeLockVersion {
-		return EmptyKnowledgeLock()
+		return EmptyKnowledgeLock(), nil
 	}
-	return lk
+	return lk, nil
+}
+
+func ReadKnowledgeLock(cwd string) KnowledgeLockFile {
+	return KnowledgeLockFile{Version: knowledgeLockVersion, Bundles: ReadProjectLock(cwd).Knowledge}
 }
 
 func WriteKnowledgeLock(lk KnowledgeLockFile, cwd string) error {
-	// Sort keys for deterministic output
-	sorted := KnowledgeLockFile{Version: lk.Version, Bundles: map[string]KnowledgeLockEntry{}}
-	keys := make([]string, 0, len(lk.Bundles))
-	for k := range lk.Bundles {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		sorted.Bundles[k] = lk.Bundles[k]
-	}
-	data, err := json.MarshalIndent(sorted, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(GetKnowledgeLockPath(cwd), append(data, '\n'), 0600)
+	pl := ReadProjectLock(cwd)
+	pl.Knowledge = lk.Bundles
+	return WriteProjectLock(pl, cwd)
 }
 
 func EmptyKnowledgeLock() KnowledgeLockFile {
@@ -105,8 +98,5 @@ func RemoveBundleFromKnowledgeLock(name, cwd string) error {
 		return nil
 	}
 	delete(lk.Bundles, name)
-	if len(lk.Bundles) == 0 {
-		return os.Remove(GetKnowledgeLockPath(cwd))
-	}
 	return WriteKnowledgeLock(lk, cwd)
 }

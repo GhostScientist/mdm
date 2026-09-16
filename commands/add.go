@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sethcarney/mdm/internal/agent"
 	"github.com/sethcarney/mdm/internal/blob"
 	"github.com/sethcarney/mdm/internal/git"
+	"github.com/sethcarney/mdm/internal/harness"
 	"github.com/sethcarney/mdm/internal/lock"
 	"github.com/sethcarney/mdm/internal/registry"
 	"github.com/sethcarney/mdm/internal/skill"
@@ -24,18 +24,26 @@ import (
 type AddOptions struct {
 	Global            bool
 	Project           bool
-	Agents            []string // empty = prompt
+	Harnesses         []string // empty = prompt
 	Skills            []string // empty = prompt; "*" = all
 	PreselectedSkills []string // pre-ticked in the skill picker, but others still shown
 	ListOnly          bool
 	Yes               bool // skip prompts
 	Copy              bool
-	All               bool // --all: skill '*', agent '*', -y
+	Symlink           bool
+	All               bool // --all: skill '*', harness '*', -y
 	FullDepth         bool
 	SkipAudit         bool
 	FailOnAudit       bool
 	AllowHiddenChars  bool
 	Verbose           bool
+	// RestoreMode marks a call made by `mdm skills install` restoring the lock,
+	// one source group at a time. A restore must survive a group whose source
+	// no longer yields the recorded skill, so the empty-source and
+	// nothing-installed paths return instead of exiting the process, which would
+	// abandon every later group. The caller checks the disk afterwards and
+	// reports whatever did not come back.
+	RestoreMode bool
 }
 
 func buildAddCmd(ver string) *cobra.Command {
@@ -47,12 +55,12 @@ func buildAddCmd(ver string) *cobra.Command {
 		Aliases: []string{"a"},
 		Long: fmt.Sprintf(`Add a skill package from GitHub, a URL, or a local path.
 
-The --agent (-a) and --skill (-s) flags accept multiple values. You can
+The --harness and --skill (-s) flags accept multiple values. You can
 pass them space-separated after the flag or repeat the flag for each value
 - both styles are equivalent:
 
-  mdm skills add owner/repo -a claude-code cursor
-  mdm skills add owner/repo -a claude-code -a cursor
+  mdm skills add owner/repo --harness claude-code cursor
+  mdm skills add owner/repo --harness claude-code --harness cursor
 
 %sVersion pinning:%s
 Skills are versioned via the "version:" field in their SKILL.md frontmatter.
@@ -66,8 +74,8 @@ To update to the latest version, run:  mdm skills update
 %sExamples:%s
   mdm skills add vercel-labs/agent-skills
   mdm skills add vercel-labs/agent-skills -g
-  mdm skills add vercel-labs/agent-skills -a claude-code cursor
-  mdm skills add vercel-labs/agent-skills --agent claude-code --agent cursor
+  mdm skills add vercel-labs/agent-skills --harness claude-code cursor
+  mdm skills add vercel-labs/agent-skills --harness claude-code --harness cursor
   mdm skills add https://github.com/owner/repo
   mdm skills add owner/repo#v1.2.0
   mdm skills add ./my-local-skill`, ansiBold, ansiReset, ansiBold, ansiReset),
@@ -80,7 +88,7 @@ To update to the latest version, run:  mdm skills update
 			}
 			if opts.All {
 				opts.Skills = []string{"*"}
-				opts.Agents = []string{"*"}
+				opts.Harnesses = []string{"*"}
 				opts.Yes = true
 			}
 			runAdd(src, opts)
@@ -90,18 +98,21 @@ To update to the latest version, run:  mdm skills update
 	f := cmd.Flags()
 	f.BoolVarP(&opts.Global, "global", "g", false, "Install skill globally (user-level)")
 	f.BoolVarP(&opts.Project, "project", "p", false, "Force project-scope install")
-	f.StringArrayVarP(&opts.Agents, "agent", "a", nil, "Agents to install to (repeatable, use '*' for all)")
+	f.StringArrayVar(&opts.Harnesses, "harness", nil, "Harnesses to install to (repeatable, use '*' for all)")
 	f.StringArrayVarP(&opts.Skills, "skill", "s", nil, "Skill names to install (repeatable, use '*' for all)")
 	f.BoolVarP(&opts.ListOnly, "list", "l", false, "List available skills without installing")
 	f.BoolVarP(&opts.Yes, "yes", "y", false, "Skip confirmation prompts")
-	f.BoolVar(&opts.Copy, "copy", false, "Copy files instead of symlinking")
-	f.BoolVar(&opts.All, "all", false, "Shorthand for --skill '*' --agent '*' -y")
+	f.BoolVar(&opts.Copy, "copy", false, "Copy files instead of symlinking (switches the scope to copy mode)")
+	f.BoolVar(&opts.Symlink, "symlink", false, "Symlink files from .agents/skills (the default; switches a scope back from copy mode)")
+	f.BoolVar(&opts.All, "all", false, "Shorthand for --skill '*' --harness '*' -y")
 	f.BoolVar(&opts.FullDepth, "full-depth", false, "Search all subdirectories")
 	f.BoolVar(&opts.SkipAudit, "skip-audit", false, "Skip security audit check for public skills")
 	f.BoolVar(&opts.FailOnAudit, "fail-on-audit", false, "Exit non-zero when security findings are detected instead of prompting")
 	f.BoolVar(&opts.AllowHiddenChars, "allow-hidden-chars", false, "Allow markdown files with hidden Unicode characters")
 
-	_ = cmd.RegisterFlagCompletionFunc("agent", agentFlagCompletion)
+	cmd.MarkFlagsMutuallyExclusive("copy", "symlink")
+
+	_ = cmd.RegisterFlagCompletionFunc("harness", harnessFlagCompletion)
 
 	return cmd
 }
@@ -212,24 +223,26 @@ func selectWellKnownSkills(filtered []*registry.WellKnownSkill, opts AddOptions)
 	return selected, true
 }
 
-func installWellKnownForAgents(selectedSkills []*registry.WellKnownSkill, agents []string, global bool, mode InstallMode, sourceID string, parsed source.ParsedSource, cwd string) {
+func installWellKnownForHarnesses(selectedSkills []*registry.WellKnownSkill, harnesses []string, global bool, mode InstallMode, sourceID string, parsed source.ParsedSource, cwd string) *symlinkFallbacks {
+	var fallbacks symlinkFallbacks
 	for _, s := range selectedSkills {
 		sName := sanitizeName(s.InstallName)
 		fmt.Printf("%sInstalling %s%s%s...\n", ansiDim, ansiText, s.Name, ansiReset)
-		var failedAgents []string
-		for _, agentName := range agents {
-			result := installWellKnownSkillForAgent(s, agentName, global, mode)
+		var failedHarnesses []string
+		for _, harnessName := range harnesses {
+			result := installWellKnownSkillForHarness(s, harnessName, global, mode)
+			fallbacks.note(harnessName, result)
 			if !result.Success {
-				failedAgents = append(failedAgents, agentName)
+				failedHarnesses = append(failedHarnesses, harnessName)
 			}
 		}
-		if len(failedAgents) == 0 {
+		if len(failedHarnesses) == 0 {
 			ui.LogSuccess(s.Name)
 		} else {
-			ui.LogWarn(fmt.Sprintf("%s (failed for: %s)", s.Name, strings.Join(failedAgents, ", ")))
+			ui.LogWarn(fmt.Sprintf("%s (failed for: %s)", s.Name, strings.Join(failedHarnesses, ", ")))
 		}
 		if global {
-			if err := lock.AddSkillToLock(sName, lock.SkillLockEntry{
+			if err := lock.AddSkillToGlobalState(sName, lock.SkillLockEntry{
 				Source:     sourceID,
 				SourceType: string(source.SourceTypeWellKnown),
 				SourceURL:  parsed.URL,
@@ -246,6 +259,7 @@ func installWellKnownForAgents(selectedSkills []*registry.WellKnownSkill, agents
 			}
 		}
 	}
+	return &fallbacks
 }
 
 func runAddWellKnown(parsed source.ParsedSource, opts AddOptions, cwd string) {
@@ -279,16 +293,21 @@ func runAddWellKnown(parsed source.ParsedSource, opts AddOptions, cwd string) {
 		os.Exit(1)
 	}
 
-	global, mode, agents, ok := promptScopeAndAgents(opts, cwd)
+	global, harnesses, ok := promptScopeAndHarnesses(opts, cwd)
+	if !ok {
+		return
+	}
+
+	mode, ok := commitScopeInstallMode(opts, global, cwd)
 	if !ok {
 		return
 	}
 
 	sourceID := registry.GetWellKnownSourceIdentifier(parsed.URL)
 	fmt.Println()
-	installWellKnownForAgents(selectedSkills, agents, global, mode, sourceID, parsed, cwd)
+	fallbacks := installWellKnownForHarnesses(selectedSkills, harnesses, global, mode, sourceID, parsed, cwd)
 	fmt.Println()
-	printInstallSummary(len(selectedSkills), global, agents, mode)
+	printInstallSummary(len(selectedSkills), global, harnesses, mode, fallbacks)
 	maybeShowFindPrompt(cwd)
 }
 
@@ -304,6 +323,9 @@ func runAddLocal(parsed source.ParsedSource, opts AddOptions, cwd string) {
 	skills := discoverSkillsInDir(localPath, opts.FullDepth, "")
 	if len(skills) == 0 {
 		fmt.Fprintf(os.Stderr, "%sNo skills found in %s%s\n", ansiText, localPath, ansiReset)
+		if opts.RestoreMode {
+			return
+		}
 		os.Exit(1)
 	}
 
@@ -328,17 +350,31 @@ func runAddLocal(parsed source.ParsedSource, opts AddOptions, cwd string) {
 		os.Exit(1)
 	}
 
-	global, mode, agents, ok := promptScopeAndAgents(opts, cwd)
+	global, harnesses, ok := promptScopeAndHarnesses(opts, cwd)
+	if !ok {
+		return
+	}
+
+	mode, ok := commitScopeInstallMode(opts, global, cwd)
 	if !ok {
 		return
 	}
 
 	fmt.Println()
-	installSkillsForAgents(selectedSkills, agents, global, mode, lock.SkillLockEntry{
+	if installSkillsForHarnesses(selectedSkills, harnesses, global, mode, lock.SkillLockEntry{
 		Source:     localPath,
 		SourceType: string(source.SourceTypeLocal),
 		SourceURL:  localPath,
-	}, cwd, "")
+	}, cwd, "") == 0 && !opts.RestoreMode {
+		os.Exit(1)
+	}
+	// Said after the install, not before: the install itself is fine. It is the
+	// lock entry it just wrote that no teammate can use, because a path outside
+	// the project is not part of the repository they clone.
+	if !global {
+		warnIfLocalSourceEscapesProject(localPath, cwd,
+			"To share it, vendor it into the repository with `mdm skills cherry-pick`.")
+	}
 	maybeShowFindPrompt(cwd)
 }
 
@@ -468,15 +504,22 @@ func runAddGitOrHub(parsed source.ParsedSource, opts AddOptions, cwd, sourceInpu
 		os.Exit(1)
 	}
 
-	// Start audit concurrently while scope/agent prompts run
+	// Start audit concurrently while scope/harness prompts run
 	auditCh := startInstallAudit(ownerRepo, parsed.Type, opts.SkipAudit, selectedSkills)
 
-	global, mode, agents, ok := promptScopeAndAgents(opts, cwd)
+	global, harnesses, ok := promptScopeAndHarnesses(opts, cwd)
 	if !ok {
 		return
 	}
 
 	if !confirmInstallAfterAudit(<-auditCh, opts.Yes, opts.FailOnAudit) {
+		return
+	}
+
+	// After the audit gate: declining there must not leave a converted scope
+	// with nothing installed.
+	mode, ok := commitScopeInstallMode(opts, global, cwd)
+	if !ok {
 		return
 	}
 
@@ -494,9 +537,18 @@ func runAddGitOrHub(parsed source.ParsedSource, opts AddOptions, cwd, sourceInpu
 		Ref:        lockRef,
 	}
 
-	installSkillsForAgents(selectedSkills, agents, global, mode, baseLockEntry, cwd, tmpDir)
+	exitIfNothingInstalled(installSkillsForHarnesses(selectedSkills, harnesses, global, mode, baseLockEntry, cwd, tmpDir))
 
 	maybeShowFindPrompt(cwd)
+}
+
+// exitIfNothingInstalled ends the process non-zero when an install reached no
+// harness, so a failed `mdm skills add` is a failed command rather than a clean
+// exit with a warning. Kept as a helper so callers do not each carry the branch.
+func exitIfNothingInstalled(installed int) {
+	if installed == 0 {
+		os.Exit(1)
+	}
 }
 
 // ─── Blob fast install ─────────────────────────────────────────────────────────
@@ -565,7 +617,8 @@ func selectBlobSkills(skills []*blob.BlobSkill, opts AddOptions) ([]*blob.BlobSk
 	return selected, true
 }
 
-func installBlobSkillsForAgents(selectedBlob []*blob.BlobSkill, agents []string, global bool, mode InstallMode, result *blob.BlobInstallResult, ref, sourceInput string, parsed source.ParsedSource, cwd string) {
+func installBlobSkillsForHarnesses(selectedBlob []*blob.BlobSkill, harnesses []string, global bool, mode InstallMode, result *blob.BlobInstallResult, ref, sourceInput string, parsed source.ParsedSource, cwd string) *symlinkFallbacks {
+	var fallbacks symlinkFallbacks
 	for _, bSkill := range selectedBlob {
 		sName := sanitizeName(bSkill.Name)
 		fmt.Printf("%sInstalling %s%s%s...\n", ansiDim, ansiText, bSkill.Name, ansiReset)
@@ -573,20 +626,21 @@ func installBlobSkillsForAgents(selectedBlob []*blob.BlobSkill, agents []string,
 		for i, f := range bSkill.Files {
 			files[i] = struct{ Path, Contents string }{f.Path, f.Contents}
 		}
-		var failedAgents []string
-		for _, agentName := range agents {
-			r := installSkillFilesForAgent(sName, files, agentName, global, mode)
+		var failedHarnesses []string
+		for _, harnessName := range harnesses {
+			r := installSkillFilesForHarness(sName, files, harnessName, global, mode)
+			fallbacks.note(harnessName, r)
 			if !r.Success {
-				failedAgents = append(failedAgents, agentName)
+				failedHarnesses = append(failedHarnesses, harnessName)
 			}
 		}
-		if len(failedAgents) == 0 {
+		if len(failedHarnesses) == 0 {
 			ui.LogSuccess(bSkill.Name)
 		} else {
-			ui.LogWarn(fmt.Sprintf("%s (failed for: %s)", bSkill.Name, strings.Join(failedAgents, ", ")))
+			ui.LogWarn(fmt.Sprintf("%s (failed for: %s)", bSkill.Name, strings.Join(failedHarnesses, ", ")))
 		}
 		if global {
-			if err := lock.AddSkillToLock(sName, lock.SkillLockEntry{
+			if err := lock.AddSkillToGlobalState(sName, lock.SkillLockEntry{
 				Source:     stripSourceRef(sourceInput),
 				SourceType: string(source.SourceTypeGitHub),
 				SourceURL:  parsed.URL,
@@ -607,6 +661,7 @@ func installBlobSkillsForAgents(selectedBlob []*blob.BlobSkill, agents []string,
 			}
 		}
 	}
+	return &fallbacks
 }
 
 func runAddBlob(result *blob.BlobInstallResult, parsed source.ParsedSource, opts AddOptions, cwd, ownerRepo, sourceInput string) {
@@ -647,11 +702,18 @@ func runAddBlob(result *blob.BlobInstallResult, parsed source.ParsedSource, opts
 	}
 
 	auditCh := startBlobInstallAudit(ownerRepo, opts.SkipAudit, selectedBlob)
-	global, mode, agents, ok := promptScopeAndAgents(opts, cwd)
+	global, harnesses, ok := promptScopeAndHarnesses(opts, cwd)
 	if !ok {
 		return
 	}
 	if !confirmInstallAfterAudit(<-auditCh, opts.Yes, opts.FailOnAudit) {
+		return
+	}
+
+	// After the audit gate: declining there must not leave a converted scope
+	// with nothing installed.
+	mode, ok := commitScopeInstallMode(opts, global, cwd)
+	if !ok {
 		return
 	}
 
@@ -661,32 +723,47 @@ func runAddBlob(result *blob.BlobInstallResult, parsed source.ParsedSource, opts
 	}
 
 	fmt.Println()
-	installBlobSkillsForAgents(selectedBlob, agents, global, mode, result, ref, sourceInput, parsed, cwd)
+	fallbacks := installBlobSkillsForHarnesses(selectedBlob, harnesses, global, mode, result, ref, sourceInput, parsed, cwd)
 	fmt.Println()
-	printInstallSummary(len(selectedBlob), global, agents, mode)
+	printInstallSummary(len(selectedBlob), global, harnesses, mode, fallbacks)
 	maybeShowFindPrompt(cwd)
 }
 
 // ─── Shared install logic ──────────────────────────────────────────────────────
 
-func installSkillsForAgents(skills []*skill.Skill, agents []string, global bool, mode InstallMode, baseLockEntry lock.SkillLockEntry, cwd string, cloneDir string) {
+// installSkillsForHarnesses installs each skill into every harness and records
+// it in the lock. It returns the number of skills that reached at least one
+// harness. A skill no harness accepted - refused for every one, e.g. a plugin
+// owns the name - records no lock entry and is not counted: an orphan entry the
+// lock has no install to back would otherwise survive, unremovable via
+// `mdm skills remove` and reported by doctor as missing on disk.
+func installSkillsForHarnesses(skills []*skill.Skill, harnesses []string, global bool, mode InstallMode, baseLockEntry lock.SkillLockEntry, cwd string, cloneDir string) int {
+	var fallbacks symlinkFallbacks
+	installed := 0
 	for _, s := range skills {
 		sName := sanitizeName(s.Name)
 		fmt.Printf("%sInstalling %s%s%s...\n", ansiDim, ansiText, s.Name, ansiReset)
 
-		var failedAgents []string
-		for _, agentName := range agents {
-			result := installSkillForAgent(s, agentName, global, mode)
+		var failedHarnesses []string
+		for _, harnessName := range harnesses {
+			result := installSkillForHarness(s, harnessName, global, mode)
+			fallbacks.note(harnessName, result)
 			if !result.Success {
-				failedAgents = append(failedAgents, agentName)
+				failedHarnesses = append(failedHarnesses, harnessName)
 			}
 		}
 
-		if len(failedAgents) == 0 {
+		if len(failedHarnesses) == 0 {
 			ui.LogSuccess(s.Name)
 		} else {
-			ui.LogWarn(fmt.Sprintf("%s (failed for: %s)", s.Name, strings.Join(failedAgents, ", ")))
+			ui.LogWarn(fmt.Sprintf("%s (failed for: %s)", s.Name, strings.Join(failedHarnesses, ", ")))
 		}
+
+		// No harness accepted it: write nothing to the lock and do not count it.
+		if len(failedHarnesses) == len(harnesses) {
+			continue
+		}
+		installed++
 
 		skillPath := skillMdRepoPath(s.Path, cloneDir)
 
@@ -695,7 +772,7 @@ func installSkillsForAgents(skills []*skill.Skill, agents []string, global bool,
 		lockEntry.SkillPath = skillPath
 
 		if global {
-			if err := lock.AddSkillToLock(sName, lockEntry); err != nil {
+			if err := lock.AddSkillToGlobalState(sName, lockEntry); err != nil {
 				ui.LogWarn(fmt.Sprintf("could not update lock file: %v", err))
 			}
 		} else {
@@ -715,25 +792,35 @@ func installSkillsForAgents(skills []*skill.Skill, agents []string, global bool,
 	}
 
 	fmt.Println()
-	printInstallSummary(len(skills), global, agents, mode)
+	printInstallSummary(installed, global, harnesses, mode, &fallbacks)
+	return installed
 }
 
 // skillMdRepoPath returns the repo-relative path to the SKILL.md file for a
 // skill discovered during a git clone. cloneDir is the root of the clone; when
 // empty (local or blob installs) an empty string is returned.
 func skillMdRepoPath(skillPath, cloneDir string) string {
-	if cloneDir == "" || skillPath == "" {
+	rel := repoRelPath(skillPath, cloneDir)
+	switch rel {
+	case "":
 		return ""
-	}
-	rel, err := filepath.Rel(cloneDir, skillPath)
-	if err != nil {
-		return ""
-	}
-	rel = filepath.ToSlash(rel)
-	if rel == "." {
+	case ".":
 		return "SKILL.md"
 	}
 	return rel + "/SKILL.md"
+}
+
+// repoRelPath returns path relative to the clone root, with forward slashes,
+// or "" when there is no clone (a local or blob install) or no path.
+func repoRelPath(path, cloneDir string) string {
+	if cloneDir == "" || path == "" {
+		return ""
+	}
+	rel, err := filepath.Rel(cloneDir, path)
+	if err != nil {
+		return ""
+	}
+	return filepath.ToSlash(rel)
 }
 
 // toRelSourcePath converts an absolute local path to a path relative to cwd,
@@ -850,9 +937,11 @@ func selectSkillsWithPrompt(skills []*skill.Skill, opts AddOptions, message stri
 	return selected, true
 }
 
-// promptScopeAndAgents asks for global/project scope and agent selection.
-// Returns (global bool, mode InstallMode, agents []string, ok bool).
-func promptScopeAndAgents(opts AddOptions, cwd string) (bool, InstallMode, []string, bool) {
+// promptScopeAndHarnesses asks for global/project scope and harness selection.
+// Returns (global bool, harnesses []string, ok bool). It does not settle the
+// install mode: callers run commitScopeInstallMode last, after anything
+// that can still abort the install.
+func promptScopeAndHarnesses(opts AddOptions, cwd string) (bool, []string, bool) {
 	// Determine scope
 	global := opts.Global
 	if !global && !opts.Project && !opts.Yes {
@@ -861,30 +950,47 @@ func promptScopeAndAgents(opts AddOptions, cwd string) (bool, InstallMode, []str
 			{Label: "Global", Hint: "installs for your user account"},
 		})
 		if !ok {
-			return false, "", nil, false
+			return false, nil, false
 		}
 		global = idx == 1
 	}
 
-	// Determine install mode
-	mode := InstallModeSymlink
-	if opts.Copy {
-		mode = InstallModeCopy
-	}
-
-	// Determine agents
-	agents, ok := promptAgents(opts, global, cwd)
+	// Determine harnesses
+	harnesses, ok := promptHarnesses(opts, global, cwd)
 	if !ok {
-		return false, "", nil, false
+		return false, nil, false
 	}
 
-	return global, mode, agents, true
+	return global, harnesses, true
 }
 
-func allAgentsForScope(global bool) []string {
+// commitScopeInstallMode settles the scope's install mode and returns the mode
+// to install with: an explicit --copy or --symlink wins, otherwise the recorded
+// mode is inherited, and symlink is the default. Call it immediately before
+// installing: committing re-materializes every install in the scope, and doing
+// that while the user can still back out leaves a converted scope with nothing.
+func commitScopeInstallMode(opts AddOptions, global bool, cwd string) (InstallMode, bool) {
+	requested := InstallModeSymlink
+	switch {
+	case opts.Copy:
+		requested = InstallModeCopy
+	case opts.Symlink:
+		// Explicit: overrides a recorded copy mode.
+	case lock.GetInstallMode(global, cwd) == lock.InstallModeCopy:
+		requested = InstallModeCopy
+	}
+	return applyScopeInstallMode(requested, global, cwd)
+}
+
+// allHarnessesForScope lists every harness the given scope can install to: all of
+// them in project scope, and in global scope only those with a user-level
+// skills directory. It backs `--harness *` and scopeInstallPaths. validateNamedHarnesses
+// and promptHarnessesYes apply no such filter; every registry entry sets
+// GlobalSkillsDir today, so the gap cannot trigger.
+func allHarnessesForScope(global bool) []string {
 	var all []string
-	for name := range agent.AllAgents {
-		if global && agent.AllAgents[name].GlobalSkillsDir == "" {
+	for name := range harness.AllHarnesses {
+		if global && harness.AllHarnesses[name].GlobalSkillsDir == "" {
 			continue
 		}
 		all = append(all, name)
@@ -893,25 +999,25 @@ func allAgentsForScope(global bool) []string {
 	return all
 }
 
-func validateNamedAgents(names []string) ([]string, bool) {
+func validateNamedHarnesses(names []string) ([]string, bool) {
 	var validated []string
 	for _, a := range names {
-		if agent.AllAgents[a] != nil {
+		if harness.AllHarnesses[a] != nil {
 			validated = append(validated, a)
 		} else {
-			ui.LogWarn("Unknown agent: " + a)
+			ui.LogWarn("Unknown harness: " + a)
 		}
 	}
 	if len(validated) == 0 {
-		fmt.Fprintf(os.Stderr, "%sNo valid agents specified.%s\n", ansiText, ansiReset)
+		fmt.Fprintf(os.Stderr, "%sNo valid harnesses specified.%s\n", ansiText, ansiReset)
 		return nil, false
 	}
 	return validated, true
 }
 
-func buildDetectedUniqueAgents(detected []string) []string {
+func buildDetectedUniqueHarnesses(detected []string) []string {
 	var result []string
-	for _, a := range agent.GetUniqueSkillsDirAgents() {
+	for _, a := range harness.GetUniqueSkillsDirHarnesses() {
 		for _, d := range detected {
 			if d == a {
 				result = append(result, a)
@@ -922,17 +1028,17 @@ func buildDetectedUniqueAgents(detected []string) []string {
 	return result
 }
 
-func buildUniqueAgentOptions(detectedUnique []string, global bool) []ui.UIOption {
+func buildUniqueHarnessOptions(detectedUnique []string, global bool) []ui.UIOption {
 	var options []ui.UIOption
 	for _, a := range detectedUnique {
-		cfg := agent.AllAgents[a]
+		cfg := harness.AllHarnesses[a]
 		if cfg == nil || (global && cfg.GlobalSkillsDir == "") {
 			continue
 		}
 		options = append(options, ui.UIOption{Label: cfg.DisplayName, Value: a})
 	}
-	for name, cfg := range agent.AllAgents {
-		if agent.UsesSharedSkillsDir(name) || (global && cfg.GlobalSkillsDir == "") {
+	for name, cfg := range harness.AllHarnesses {
+		if harness.UsesSharedSkillsDir(name) || (global && cfg.GlobalSkillsDir == "") {
 			continue
 		}
 		alreadyIn := false
@@ -949,10 +1055,10 @@ func buildUniqueAgentOptions(detectedUnique []string, global bool) []ui.UIOption
 	return options
 }
 
-func buildLockedAgentOptions(global bool) []ui.UIOption {
+func buildLockedHarnessOptions(global bool) []ui.UIOption {
 	var lockedOptions []ui.UIOption
-	for _, a := range agent.GetSharedSkillsDirAgents() {
-		cfg := agent.AllAgents[a]
+	for _, a := range harness.GetSharedSkillsDirHarnesses() {
+		cfg := harness.AllHarnesses[a]
 		if cfg == nil || (global && cfg.GlobalSkillsDir == "") {
 			continue
 		}
@@ -961,7 +1067,7 @@ func buildLockedAgentOptions(global bool) []ui.UIOption {
 	return lockedOptions
 }
 
-func computeAgentInitSel(options []ui.UIOption, detectedUnique []string, lastSelected []string) []int {
+func computeHarnessInitSel(options []ui.UIOption, detectedUnique []string, lastSelected []string) []int {
 	lastSelectedSet := map[string]bool{}
 	for _, a := range lastSelected {
 		lastSelectedSet[a] = true
@@ -985,12 +1091,12 @@ func computeAgentInitSel(options []ui.UIOption, detectedUnique []string, lastSel
 	return initSel
 }
 
-// promptAgentsYes resolves the agent list when --yes is set, using configured
-// agents when available and falling back to detected agents.
-func promptAgentsYes(configured []string, lockedOptions, options []ui.UIOption, detected []string) []string {
+// promptHarnessesYes resolves the harness list when --yes is set, using configured
+// harnesses when available and falling back to detected harnesses.
+func promptHarnessesYes(configured []string, lockedOptions, options []ui.UIOption, detected []string) []string {
 	if len(configured) > 0 {
-		// configuredAgents only holds non-universal agents; always expand
-		// with the locked universal agents for the actual installation.
+		// configuredHarnesses only holds non-universal harnesses; always expand
+		// with the locked universal harnesses for the actual installation.
 		added := make(map[string]bool)
 		var result []string
 		for _, lo := range lockedOptions {
@@ -1004,10 +1110,10 @@ func promptAgentsYes(configured []string, lockedOptions, options []ui.UIOption, 
 		}
 		return result
 	}
-	return yesAgents(options, lockedOptions, detected)
+	return yesHarnesses(options, lockedOptions, detected)
 }
 
-func yesAgents(options []ui.UIOption, lockedOptions []ui.UIOption, detected []string) []string {
+func yesHarnesses(options []ui.UIOption, lockedOptions []ui.UIOption, detected []string) []string {
 	var result []string
 	for _, lo := range lockedOptions {
 		result = append(result, lo.Value)
@@ -1024,30 +1130,30 @@ func yesAgents(options []ui.UIOption, lockedOptions []ui.UIOption, detected []st
 	return result
 }
 
-// promptAgents returns the list of agents to install to.
-func promptAgents(opts AddOptions, global bool, cwd string) ([]string, bool) {
-	if len(opts.Agents) > 0 && opts.Agents[0] == "*" {
-		return allAgentsForScope(global), true
+// promptHarnesses returns the list of harnesses to install to.
+func promptHarnesses(opts AddOptions, global bool, cwd string) ([]string, bool) {
+	if len(opts.Harnesses) > 0 && opts.Harnesses[0] == "*" {
+		return allHarnessesForScope(global), true
 	}
-	if len(opts.Agents) > 0 {
-		return validateNamedAgents(opts.Agents)
+	if len(opts.Harnesses) > 0 {
+		return validateNamedHarnesses(opts.Harnesses)
 	}
 
-	detected := agent.DetectInstalledAgents()
-	detectedUnique := buildDetectedUniqueAgents(detected)
-	options := buildUniqueAgentOptions(detectedUnique, global)
-	lockedOptions := buildLockedAgentOptions(global)
+	detected := harness.DetectInstalledHarnesses()
+	detectedUnique := buildDetectedUniqueHarnesses(detected)
+	options := buildUniqueHarnessOptions(detectedUnique, global)
+	lockedOptions := buildLockedHarnessOptions(global)
 
-	// If the user has a configured agent list for this scope, use it as the
+	// If the user has a configured harness list for this scope, use it as the
 	// default - for both --yes and the interactive picker.
-	configured := lock.GetConfiguredAgents(global, cwd)
+	configured := lock.GetConfiguredHarnesses(global, cwd)
 
 	if opts.Yes {
-		return promptAgentsYes(configured, lockedOptions, options, detected), true
+		return promptHarnessesYes(configured, lockedOptions, options, detected), true
 	}
 
 	if len(options) == 0 && len(lockedOptions) == 0 {
-		fmt.Fprintf(os.Stderr, "%sNo agents available.%s\n", ansiText, ansiReset)
+		fmt.Fprintf(os.Stderr, "%sNo harnesses available.%s\n", ansiText, ansiReset)
 		return nil, false
 	}
 	if len(options) == 0 {
@@ -1058,8 +1164,8 @@ func promptAgents(opts AddOptions, global bool, cwd string) ([]string, bool) {
 		return result, true
 	}
 
-	initSel := computeAgentInitSel(options, detectedUnique, configured)
-	selectedIndices, ok := ui.UiSearchMultiselect("Which agents would you like to install to?", options, lockedOptions, initSel, false)
+	initSel := computeHarnessInitSel(options, detectedUnique, configured)
+	selectedIndices, ok := ui.UiSearchMultiselect("Which harnesses would you like to install to?", options, lockedOptions, initSel, false)
 	if !ok {
 		return nil, false
 	}
@@ -1073,7 +1179,7 @@ func promptAgents(opts AddOptions, global bool, cwd string) ([]string, bool) {
 		result = append(result, options[i].Value)
 		userSelected = append(userSelected, options[i].Value)
 	}
-	// Preserve any previously configured agents that weren't shown in the
+	// Preserve any previously configured harnesses that weren't shown in the
 	// picker (e.g. github-copilot: uses .agents/skills so it's in the locked
 	// panel, but has a unique instructions file so it was explicitly configured
 	// via rules link). Merge them into the saved list so they aren't wiped.
@@ -1086,10 +1192,10 @@ func promptAgents(opts AddOptions, global bool, cwd string) ([]string, bool) {
 			userSelected = append(userSelected, c)
 		}
 	}
-	// Only save the user's explicit non-universal selections. Universal agents
+	// Only save the user's explicit non-universal selections. Universal harnesses
 	// (.agents/skills) are always supported - no need to track them.
-	if err := lock.SetConfiguredAgents(userSelected, global, cwd); err != nil {
-		ui.LogWarn(fmt.Sprintf("could not save agent preferences: %v", err))
+	if err := lock.SetConfiguredHarnesses(userSelected, global, cwd); err != nil {
+		ui.LogWarn(fmt.Sprintf("could not save harness preferences: %v", err))
 	}
 	return result, true
 }
@@ -1127,28 +1233,36 @@ func reorderSkillsPreselectedFirst(skills []*skill.Skill, preselected []string) 
 	return reordered, initSel
 }
 
-func printInstallSummary(count int, global bool, agents []string, mode InstallMode) {
+// printInstallSummary prints the closing line of an install run. fallbacks
+// may be nil; when it records installs that were copied because a symlink
+// could not be created, the summary says so and a warning follows, so the
+// mode on the summary line never contradicts what is on disk.
+func printInstallSummary(count int, global bool, harnesses []string, mode InstallMode, fallbacks *symlinkFallbacks) {
 	scope := "project"
 	if global {
 		scope = "global"
+	}
+	if count == 0 {
+		fmt.Printf("%sNo skills were installed (%s scope).%s\n\n", ansiYellow, scope, ansiReset)
+		fallbacks.warn()
+		return
 	}
 	noun := "skill"
 	if count != 1 {
 		noun = "skills"
 	}
-	fmt.Printf("%s✓ Installed %d %s (%s scope, %s mode)%s\n", ansiText, count, noun, scope, string(mode), ansiReset)
-	if len(agents) > 0 {
-		var displayNames []string
-		for _, a := range agents {
-			if cfg := agent.AllAgents[a]; cfg != nil {
-				displayNames = append(displayNames, cfg.DisplayName)
-			} else {
-				displayNames = append(displayNames, a)
-			}
-		}
-		fmt.Printf("%s  Agents: %s%s\n", ansiDim, strings.Join(displayNames, ", "), ansiReset)
+	modeNote := string(mode)
+	if fallbacks.any() {
+		modeNote += " mode, copied where symlinks failed"
+	} else {
+		modeNote += " mode"
+	}
+	fmt.Printf("%s✓ Installed %d %s (%s scope, %s)%s\n", ansiText, count, noun, scope, modeNote, ansiReset)
+	if len(harnesses) > 0 {
+		fmt.Printf("%s  Harnesses: %s%s\n", ansiDim, strings.Join(harnessDisplayNames(harnesses), ", "), ansiReset)
 	}
 	fmt.Println()
+	fallbacks.warn()
 }
 
 func maybeShowFindPrompt(cwd string) {
@@ -1351,7 +1465,7 @@ func alreadyInstalledFromSource(parsedURL, cwd string) []string {
 	var result []string
 
 	// Global lock stores a canonical SourceURL field.
-	globalL := lock.ReadSkillLock()
+	globalL := lock.ReadGlobalState()
 	for name, e := range globalL.Skills {
 		if strings.EqualFold(e.SourceURL, parsedURL) && !seen[name] {
 			seen[name] = true

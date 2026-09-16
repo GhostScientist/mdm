@@ -7,7 +7,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/sethcarney/mdm/internal/experimental"
 	"github.com/sethcarney/mdm/internal/git"
 	"github.com/sethcarney/mdm/internal/lock"
 	"github.com/sethcarney/mdm/internal/source"
@@ -130,9 +129,9 @@ func (c *remoteTagCache) fetch(gitURL string) ([]string, error) {
 
 // checkRemoteTagUpToDate compares the current semver tag against the latest
 // stable release on the remote. Returns (upToDate, latestTag, err).
-func checkRemoteTagUpToDate(gitURL, currentRef string, tags *remoteTagCache) (bool, string, error) {
+func checkRemoteTagUpToDate(gitURL, currentRef, command string, tags *remoteTagCache) (bool, string, error) {
 	if !git.IsSemverTag(currentRef) {
-		return false, "", fmt.Errorf("not pinned to a version tag; use `mdm skills add <source>#<tag>` to pin")
+		return false, "", fmt.Errorf("not pinned to a version tag; use `mdm %s add <source>#<tag>` to pin", command)
 	}
 	allTags, err := tags.fetch(gitURL)
 	if err != nil {
@@ -159,6 +158,16 @@ type updateCandidate struct {
 	source     string
 	sourceType string
 	ref        string
+	command    string // the command group that re-adds it: "skills" or "agents"
+}
+
+// commandGroup is the command group a candidate's hint should name; an unset
+// value means skills, which is what every candidate was before agents had one.
+func (c updateCandidate) commandGroup() string {
+	if c.command == "" {
+		return "skills"
+	}
+	return c.command
 }
 
 // updateGroup is the set of skills that resolve to the same source at the same
@@ -184,7 +193,7 @@ func (g *updateGroup) add(c updateCandidate) {
 }
 
 func collectGlobalCandidates(skillFilter []string) []updateCandidate {
-	l := lock.ReadSkillLock()
+	l := lock.ReadGlobalState()
 	names := make([]string, 0, len(l.Skills))
 	for name := range l.Skills {
 		names = append(names, name)
@@ -244,7 +253,7 @@ func checkCandidateUpToDate(c updateCandidate, tags *remoteTagCache) (bool, stri
 		return true, "", nil
 	}
 	parsed := source.ParseSource(c.source)
-	return checkRemoteTagUpToDate(parsed.URL, c.ref, tags)
+	return checkRemoteTagUpToDate(parsed.URL, c.ref, c.commandGroup(), tags)
 }
 
 // upToDateCheck reports whether a candidate is already current, and if not, the
@@ -261,7 +270,14 @@ func planUpdates(candidates []updateCandidate, check upToDateCheck, stats *updat
 
 	for _, c := range candidates {
 		if c.sourceType == string(source.SourceTypeLocal) {
-			vlog(verboseFlag, "skip %s: local source is not remotely updatable", c.lockName)
+			// A local source is never re-fetched: for skills it is often a
+			// cherry-picked fork that must not be overwritten, and for agent
+			// definitions edits belong in the source and are picked up by a
+			// re-add. Say so out loud rather than folding it silently into the
+			// "up to date" count, which read as though the source had been
+			// checked and found current.
+			vlog(verboseFlag, "skip %s: local source is not re-fetched", c.lockName)
+			ui.LogInfo(fmt.Sprintf("%s: installed from a local path, not re-fetched - edit the source and re-run `mdm %s add` to refresh it", c.lockName, c.commandGroup()))
 			stats.skipped++
 			continue
 		}
@@ -342,11 +358,9 @@ func runUpdateGroups(groups []updateGroup, global bool, opts UpdateOptions, stat
 
 // hintPluginOwnedUpdateFilters points an explicit filter that names a
 // plugin-owned skill at mdm plugins update - plugin skills never appear in
-// skills-lock.json, so the name would otherwise silently match nothing.
+// the skills lock section, so the name would otherwise silently match
+// nothing.
 func hintPluginOwnedUpdateFilters(skillFilter []string, cwd string) {
-	if !experimental.Enabled(experimental.Plugins) {
-		return
-	}
 	for _, name := range skillFilter {
 		if owner := pluginOwningSkill(name, cwd); owner != "" {
 			ui.LogWarn(fmt.Sprintf("%s is managed by plugin %s - update it with 'mdm plugins update %s'", name, owner, owner))
@@ -385,6 +399,6 @@ func runUpdateWithOpts(skillFilter []string, opts UpdateOptions) {
 		fmt.Printf("%sNo skills to update.%s\n", ansiDim, ansiReset)
 		return
 	}
-	fmt.Printf("%sUpdate complete:%s %d updated, %d already up to date\n", ansiText, ansiReset, stats.updated, stats.skipped)
+	fmt.Printf("%sUpdate complete:%s %d updated, %d unchanged\n", ansiText, ansiReset, stats.updated, stats.skipped)
 	fmt.Println()
 }

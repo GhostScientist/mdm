@@ -123,7 +123,7 @@ func TestAddHelp(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("mdm skills add --help exited %d", code)
 	}
-	for _, expected := range []string{"--agent", "--skill"} {
+	for _, expected := range []string{"--harness", "--skill"} {
 		if !strings.Contains(stdout, expected) {
 			t.Errorf("expected skills add --help output to contain %q, got: %q", expected, stdout)
 		}
@@ -168,6 +168,38 @@ func TestDoctorHelp(t *testing.T) {
 	}
 }
 
+// A project-scoped doctor run is a CI gate: it must not exit 1 because the
+// machine's global state file is unreadable. The global migration check still
+// runs and still reports the problem, but at warn level outside global scope.
+func TestDoctorProjectScopeDoesNotFailOnUnreadableGlobalState(t *testing.T) {
+	projectDir := t.TempDir()
+	stateDir := t.TempDir()
+
+	// A truncated write, which is how this file actually ends up unreadable.
+	statePath := filepath.Join(stateDir, "mdm", "state.json")
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, []byte(`{"version": 2, "skills": {`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	env := isolatedEnv(projectDir, stateDir)
+	stdout, stderr, code := runMdmInDir(t, projectDir, env, "doctor", "-p")
+	combined := stdout + stderr
+	if code != 0 {
+		t.Fatalf("mdm doctor -p exited %d over a global-state problem:\n%s", code, combined)
+	}
+	if !strings.Contains(combined, "global state could not be read") {
+		t.Errorf("expected the problem to still be reported, got:\n%s", combined)
+	}
+
+	// The same problem in a global-scoped run is still a hard failure.
+	if _, _, code := runMdmInDir(t, projectDir, env, "doctor", "-g"); code == 0 {
+		t.Error("mdm doctor -g exited 0 despite an unreadable global state file")
+	}
+}
+
 func runMdmInDir(t *testing.T, dir string, env []string, args ...string) (stdout string, stderr string, exitCode int) {
 	t.Helper()
 	cmd := exec.Command(mdmBin, args...)
@@ -192,23 +224,19 @@ func runMdmInDir(t *testing.T, dir string, env []string, args ...string) (stdout
 }
 
 func TestInstallNoLockFile(t *testing.T) {
-	// Run in an isolated temp dir with no skills-lock.json and a fresh XDG_STATE_HOME
+	// Run in an isolated temp dir with no lock file and a fresh XDG_STATE_HOME
 	// so there is no global lock file either.
 	tmpDir := t.TempDir()
 	stateDir := t.TempDir()
 
 	// Build a minimal environment (inherit PATH so the binary can run).
-	env := []string{
-		"PATH=" + os.Getenv("PATH"),
-		"HOME=" + tmpDir,
-		"XDG_STATE_HOME=" + stateDir,
-	}
+	env := isolatedEnv(tmpDir, stateDir)
 
 	stdout, stderr, _ := runMdmInDir(t, tmpDir, env, "skills", "install", "-y")
 	combined := stdout + stderr
 
-	if !strings.Contains(combined, "No skills-lock.json found") {
-		t.Errorf("expected 'No skills-lock.json found' in output, got stdout=%q stderr=%q", stdout, stderr)
+	if !strings.Contains(combined, "No "+lockName+" found") {
+		t.Errorf("expected 'No mdm.lock found' in output, got stdout=%q stderr=%q", stdout, stderr)
 	}
 	if strings.Contains(combined, "Please provide a package source") {
 		t.Errorf("unexpected 'Please provide a package source' error in output: stdout=%q stderr=%q", stdout, stderr)
@@ -220,15 +248,32 @@ func TestInstallHelp(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("mdm skills install --help exited %d", code)
 	}
-	if !strings.Contains(stdout, "Restore skills from skills-lock.json") {
+	// The Long description wraps across lines, so check for its opening
+	// clause and a separate mention of agent definitions rather than one
+	// exact substring spanning the wrap.
+	if !strings.Contains(stdout, "Restore every skill recorded in "+lockName) {
 		t.Errorf("expected install help to contain description, got: %q", stdout)
+	}
+	if !strings.Contains(stdout, "agent") {
+		t.Errorf("expected install help to mention agent definitions, got: %q", stdout)
+	}
+
+	// The Short summary (shown in `mdm skills --help`'s subcommand list, not
+	// here) must say the same thing, so people scanning that list already
+	// know install restores both.
+	parentStdout, _, parentCode := runMdm(t, "skills", "--help")
+	if parentCode != 0 {
+		t.Fatalf("mdm skills --help exited %d", parentCode)
+	}
+	if !strings.Contains(parentStdout, "Restore skills, then agent definitions, from "+lockName) {
+		t.Errorf("expected 'mdm skills' help to summarize install as restoring skills and agent definitions, got: %q", parentStdout)
 	}
 }
 
 func TestNormalizeMultiFlags(t *testing.T) {
 	// This should NOT produce "unknown flag" or "flag needs an argument" in stderr.
 	// Uses a non-existent local path so it fails fast without any network call.
-	_, stderr, _ := runMdm(t, "skills", "add", "/nonexistent-mdm-test-path", "-a", "claude", "cursor", "--list")
+	_, stderr, _ := runMdm(t, "skills", "add", "/nonexistent-mdm-test-path", "--harness", "claude", "cursor", "--list")
 	if strings.Contains(stderr, "unknown flag") {
 		t.Errorf("unexpected 'unknown flag' in stderr: %q", stderr)
 	}
@@ -285,26 +330,26 @@ func TestLocalSkillLockUsesRelativePath(t *testing.T) {
 
 	// Install the local skill into the project scope, non-interactively.
 	stdout, stderr, code := runMdmInDir(t, projectDir, env,
-		"skills", "add", skillDir, "--agent", "claude-code", "--project", "-y")
+		"skills", "add", skillDir, "--harness", "claude-code", "--project", "-y")
 	if code != 0 {
 		t.Fatalf("mdm skills add failed (code %d):\nstdout: %s\nstderr: %s", code, stdout, stderr)
 	}
 
 	// Read the produced lock file.
-	lockPath := filepath.Join(projectDir, "skills-lock.json")
+	lockPath := filepath.Join(projectDir, lockName)
 	data, err := os.ReadFile(lockPath)
 	if err != nil {
-		t.Fatalf("reading skills-lock.json: %v", err)
+		t.Fatalf("reading mdm.lock: %v", err)
 	}
 	content := string(data)
 
 	// The stored source must NOT be an absolute path - it should be relative.
 	if strings.Contains(content, skillDir) {
-		t.Errorf("skills-lock.json contains the absolute skill path %q; expected a relative path.\nlock file:\n%s", skillDir, content)
+		t.Errorf("mdm.lock contains the absolute skill path %q; expected a relative path.\nlock file:\n%s", skillDir, content)
 	}
 	// It should start with "./" or "../" in the JSON.
 	if !strings.Contains(content, `"./`) && !strings.Contains(content, `"../`) {
-		t.Errorf("skills-lock.json does not contain a relative path (./ or ../).\nlock file:\n%s", content)
+		t.Errorf("mdm.lock does not contain a relative path (./ or ../).\nlock file:\n%s", content)
 	}
 }
 
@@ -315,7 +360,7 @@ func TestSkillsAddBlocksHiddenMarkdownCharacters(t *testing.T) {
 
 	env := isolatedEnv(projectDir, stateDir)
 	stdout, stderr, code := runMdmInDir(t, projectDir, env,
-		"skills", "add", skillDir, "--agent", "claude-code", "--project", "-y")
+		"skills", "add", skillDir, "--harness", "claude-code", "--project", "-y")
 	combined := stdout + stderr
 	if code == 0 {
 		t.Fatalf("expected hidden character scan to block install, got code 0:\n%s", combined)
@@ -335,7 +380,7 @@ func TestSkillsAddAllowsHiddenMarkdownCharactersWithFlag(t *testing.T) {
 
 	env := isolatedEnv(projectDir, stateDir)
 	stdout, stderr, code := runMdmInDir(t, projectDir, env,
-		"skills", "add", skillDir, "--agent", "claude-code", "--project", "-y", "--allow-hidden-chars")
+		"skills", "add", skillDir, "--harness", "claude-code", "--project", "-y", "--allow-hidden-chars")
 	combined := stdout + stderr
 	if code != 0 {
 		t.Fatalf("expected install with --allow-hidden-chars to succeed, got code %d:\n%s", code, combined)
@@ -344,6 +389,33 @@ func TestSkillsAddAllowsHiddenMarkdownCharactersWithFlag(t *testing.T) {
 		t.Fatalf("expected allow warning in output, got:\n%s", combined)
 	}
 	if _, err := os.Stat(filepath.Join(projectDir, ".agents", "skills", "hidden-test-skill", "SKILL.md")); err != nil {
+		t.Fatalf("expected skill to be installed, stat err=%v", err)
+	}
+}
+
+func TestSkillsAddWarnsButInstallsEmojiVariationSequences(t *testing.T) {
+	projectDir := t.TempDir()
+	stateDir := t.TempDir()
+	root, err := findModRoot()
+	if err != nil {
+		t.Fatalf("finding module root: %v", err)
+	}
+	skillDir := filepath.Join(root, "tests", "testdata", "emoji-skill")
+
+	env := isolatedEnv(projectDir, stateDir)
+	stdout, stderr, code := runMdmInDir(t, projectDir, env,
+		"skills", "add", skillDir, "--harness", "claude-code", "--project", "-y")
+	combined := stdout + stderr
+	if code != 0 {
+		t.Fatalf("expected picker emoji to install without --allow-hidden-chars, got code %d:\n%s", code, combined)
+	}
+	if !strings.Contains(combined, "Hidden character warnings in emoji-test-skill") || !strings.Contains(combined, "variation-selector") {
+		t.Fatalf("expected the downgraded findings to stay in the report, got:\n%s", combined)
+	}
+	if strings.Contains(combined, "Installation blocked") {
+		t.Fatalf("warnings must not block, got:\n%s", combined)
+	}
+	if _, err := os.Stat(filepath.Join(projectDir, ".agents", "skills", "emoji-test-skill", "SKILL.md")); err != nil {
 		t.Fatalf("expected skill to be installed, stat err=%v", err)
 	}
 }
@@ -381,7 +453,11 @@ func TestSkillsInstallBlocksHiddenMarkdownCharactersFromLock(t *testing.T) {
 func isolatedEnv(home, stateDir string) []string {
 	return []string{
 		"PATH=" + os.Getenv("PATH"),
+		// os.UserHomeDir reads USERPROFILE on Windows and HOME elsewhere, and
+		// the binary resolves every global install path from it. Set both, or
+		// the isolation silently does nothing on one of the two platforms.
 		"HOME=" + home,
+		"USERPROFILE=" + home,
 		"XDG_STATE_HOME=" + stateDir,
 	}
 }
@@ -452,11 +528,7 @@ func setupCherryPick(t *testing.T) cherryPickFixture {
 	return cherryPickFixture{
 		project:  projectDir,
 		upstream: writeUpstreamFixture(t, filepath.Join(parentDir, "upstream")),
-		env: []string{
-			"PATH=" + os.Getenv("PATH"),
-			"HOME=" + parentDir,
-			"XDG_STATE_HOME=" + filepath.Join(parentDir, "state"),
-		},
+		env:      isolatedEnv(parentDir, filepath.Join(parentDir, "state")),
 	}
 }
 
@@ -602,5 +674,145 @@ func TestCherryPickDryRunWritesNothing(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(f.project, "skills")); !os.IsNotExist(err) {
 		t.Error("a dry run must not create the forks directory")
+	}
+}
+
+// `mdm harnesses` owns what `mdm agents` used to mean (the configured AI
+// harness list). `mdm agents` is reclaimed in this same release for agent
+// definitions, a different concept - so the two commands must both resolve,
+// and their help text must not read as the same thing under two names.
+func TestHarnessesReplacesAgentsCommand(t *testing.T) {
+	out, _, code := runMdm(t, "harnesses", "--help")
+	if code != 0 {
+		t.Fatalf("`mdm harnesses` exited %d, want 0\n%s", code, out)
+	}
+	if strings.Contains(out, "agent definitions") {
+		t.Errorf("`mdm harnesses --help` reads like the agent-definitions command:\n%s", out)
+	}
+}
+
+// `mdm agents` is the reclaimed name. It must exist by the end of the
+// release that removed the old one, and it must take --agent/-a.
+func TestAgentsCommandManagesDefinitions(t *testing.T) {
+	out, _, code := runMdm(t, "agents", "--help")
+	if code != 0 {
+		t.Fatalf("`mdm agents` exited %d, want 0\n%s", code, out)
+	}
+	for _, sub := range []string{"add", "list", "remove"} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("`mdm agents --help` does not mention %q:\n%s", sub, out)
+		}
+	}
+	addOut, _, _ := runMdm(t, "agents", "add", "--help")
+	if !strings.Contains(addOut, "-a, --agent") {
+		t.Errorf("`mdm agents add` must take -a, --agent:\n%s", addOut)
+	}
+	if strings.Contains(addOut, "-a, --harness") {
+		t.Errorf("`mdm agents add`'s --harness must not take the -a shorthand; it collides with --agent:\n%s", addOut)
+	}
+}
+
+// -a must be free for --agent in the agent-definition command. A shorthand
+// left on --harness would collide with it.
+func TestHarnessFlagHasNoShorthand(t *testing.T) {
+	out, _, _ := runMdm(t, "skills", "add", "--help")
+	if !strings.Contains(out, "--harness") {
+		t.Errorf("--harness missing from `skills add --help`:\n%s", out)
+	}
+	if strings.Contains(out, "-a, --harness") {
+		t.Errorf("--harness must not take the -a shorthand:\n%s", out)
+	}
+	if strings.Contains(out, "--agent ") {
+		t.Errorf("`skills add` must not gain --agent; that belongs to `mdm agents add`:\n%s", out)
+	}
+}
+
+// `--all` used to set the harness filter to "*". Nothing expanded that for
+// harnesses, so the retention check saw every harness as still holding the
+// skill and the removal was a silent no-op with exit 0. A unit test on
+// removeSkillFromDisk passes either way; only the command shows the flag.
+func TestSkillsRemoveAllRemovesEverySkill(t *testing.T) {
+	projectDir := t.TempDir()
+	stateDir := t.TempDir()
+	skillDir := filepath.Join(projectDir, "sk", "my-skill")
+	if err := os.MkdirAll(skillDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	skillMd := "---\nname: my-skill\ndescription: removed by --all\n---\nbody\n"
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(skillMd), 0644); err != nil {
+		t.Fatal(err)
+	}
+	env := isolatedEnv(projectDir, stateDir)
+
+	stdout, stderr, code := runMdmInDir(t, projectDir, env,
+		"skills", "add", "./sk", "--harness", "claude-code", "--project", "-y")
+	if code != 0 {
+		t.Fatalf("mdm skills add failed (code %d):\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	canonical := filepath.Join(projectDir, ".agents", "skills", "my-skill")
+	if _, err := os.Stat(canonical); err != nil {
+		t.Fatalf("setup: canonical skill missing after add: %v", err)
+	}
+
+	stdout, stderr, code = runMdmInDir(t, projectDir, env, "skills", "remove", "--all")
+	if code != 0 {
+		t.Fatalf("mdm skills remove --all exited %d:\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "Removed my-skill") {
+		t.Errorf("expected 'Removed my-skill' in output, got:\nstdout: %s\nstderr: %s", stdout, stderr)
+	}
+	if _, err := os.Lstat(filepath.Join(projectDir, ".claude", "skills", "my-skill")); !os.IsNotExist(err) {
+		t.Errorf("Claude Code's install should be gone, Lstat err = %v", err)
+	}
+	if _, err := os.Stat(canonical); !os.IsNotExist(err) {
+		t.Errorf("canonical directory should be gone, Stat err = %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(projectDir, lockName)); err == nil && strings.Contains(string(data), "my-skill") {
+		t.Errorf("lock file still records my-skill:\n%s", data)
+	}
+}
+
+// The rename has no alias, so an old invocation fails. It must fail with a
+// pointer, not a bare cobra error or a git clone of a repository called
+// "cursor". These drive the binary because the hint for the flag is printed
+// by main, after cobra has already rejected the flag.
+func TestRenamedFlagAndCommandFailWithAHint(t *testing.T) {
+	projectDir := t.TempDir()
+	stateDir := t.TempDir()
+	env := isolatedEnv(projectDir, stateDir)
+
+	_, stderr, code := runMdmInDir(t, projectDir, env, "skills", "add", "./sk", "--agent", "claude-code")
+	if code == 0 {
+		t.Fatal("`skills add --agent` succeeded; the flag was removed")
+	}
+	if !strings.Contains(stderr, "--harness") || !strings.Contains(stderr, "mdm harnesses") {
+		t.Errorf("`--agent` should fail with a hint naming --harness and mdm harnesses, got:\n%s", stderr)
+	}
+
+	_, stderr, code = runMdmInDir(t, projectDir, env, "skills", "add", "./sk", "-a", "claude-code")
+	if code == 0 {
+		t.Fatal("`skills add -a` succeeded; the shorthand was removed")
+	}
+	if !strings.Contains(stderr, "--harness") {
+		t.Errorf("`-a` should fail with the same hint, got:\n%s", stderr)
+	}
+
+	_, stderr, code = runMdmInDir(t, projectDir, env, "agents", "add", "cursor", "--project", "-y")
+	if code == 0 {
+		t.Fatal("`agents add cursor` succeeded; a harness name is not a source")
+	}
+	if !strings.Contains(stderr, "mdm harnesses add cursor") {
+		t.Errorf("`agents add cursor` should point at mdm harnesses add cursor, got:\n%s", stderr)
+	}
+	if strings.Contains(stderr, "repository") {
+		t.Errorf("`agents add cursor` should stop before any clone is attempted, got:\n%s", stderr)
+	}
+
+	stdout, _, code := runMdmInDir(t, projectDir, env, "agents", "list", "--project")
+	if code != 0 {
+		t.Fatalf("`agents list` exited %d", code)
+	}
+	if !strings.Contains(stdout, "mdm harnesses list") {
+		t.Errorf("the empty `agents list` should say where the harness list went, got:\n%s", stdout)
 	}
 }
